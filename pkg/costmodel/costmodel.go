@@ -187,7 +187,7 @@ const (
 	) by (namespace,container_name,pod_name,node,%s)`
 	queryPVRequestsStr = `avg(avg(kube_persistentvolumeclaim_info{volumename != "", %s}) by (persistentvolumeclaim, storageclass, namespace, volumename, %s, kubernetes_node)
 	*
-	on (persistentvolumeclaim, namespace, %s, kubernetes_node) group_right(storageclass, volumename)
+	on (persistentvolumeclaim, namespace, %s, kubernetes_node) group_left(storageclass, volumename)
 	sum(kube_persistentvolumeclaim_resource_requests_storage_bytes{%s}) by (persistentvolumeclaim, namespace, %s, kubernetes_node, kubernetes_name)) by (persistentvolumeclaim, storageclass, namespace, %s, volumename, kubernetes_node)`
 	// queryRAMAllocationByteHours yields the total byte-hour RAM allocation over the given
 	// window, aggregated by container.
