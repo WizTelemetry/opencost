@@ -15,6 +15,9 @@ import (
 	"github.com/patrickmn/go-cache"
 	prometheusClient "github.com/prometheus/client_golang/api"
 
+	allocationfilter "github.com/opencost/opencost/core/pkg/filter/allocation"
+	"github.com/opencost/opencost/core/pkg/filter/ast"
+	"github.com/opencost/opencost/core/pkg/filter/matcher"
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/opencost"
 	"github.com/opencost/opencost/core/pkg/util"
@@ -2214,9 +2217,34 @@ func (a *Accesses) ComputeAllocationHandlerSummary(w http.ResponseWriter, r *htt
 		}
 	}
 
+	filterString := qp.Get("filter", "")
+	var filter opencost.AllocationMatcher
+	if filterString == "" {
+		filter = &matcher.AllPass[*opencost.Allocation]{}
+	} else {
+		parser := allocationfilter.NewAllocationFilterParser()
+		tree, errParse := parser.Parse(filterString)
+		if errParse != nil {
+			err := fmt.Errorf("err parsing filter '%s': %v", ast.ToPreOrderShortString(tree), errParse)
+			http.Error(w, fmt.Sprintf("Invalid 'filter' parameter: %s", err), http.StatusBadRequest)
+		}
+		// todo: labelconfig?
+		compiler := opencost.NewAllocationMatchCompiler(nil)
+		var err error
+		filter, err = compiler.Compile(tree)
+		if err != nil {
+			err := fmt.Errorf("err compiling filter '%s': %v", ast.ToPreOrderShortString(tree), err)
+			http.Error(w, fmt.Sprintf("Invalid 'filter' parameter: %s", err), http.StatusBadRequest)
+		}
+	}
+	if filter == nil {
+		err := fmt.Errorf("unexpected nil filter")
+		http.Error(w, fmt.Sprintf("Invalid 'filter' parameter: %s", err), http.StatusBadRequest)
+	}
+
 	sasl := []*opencost.SummaryAllocationSet{}
 	for _, as := range asr.Slice() {
-		sas := opencost.NewSummaryAllocationSet(as, nil, nil, false, false)
+		sas := opencost.NewSummaryAllocationSet(as, filter, nil, false, false)
 		sasl = append(sasl, sas)
 	}
 	sasr := opencost.NewSummaryAllocationSetRange(sasl...)
@@ -2235,6 +2263,31 @@ func (a *Accesses) ComputeAllocationHandler(w http.ResponseWriter, r *http.Reque
 	window, err := opencost.ParseWindowWithOffset(qp.Get("window", ""), env.GetParsedUTCOffset())
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid 'window' parameter: %s", err), http.StatusBadRequest)
+	}
+
+	filterString := qp.Get("filter", "")
+	var filter opencost.AllocationMatcher
+	if filterString == "" {
+		filter = &matcher.AllPass[*opencost.Allocation]{}
+	} else {
+		parser := allocationfilter.NewAllocationFilterParser()
+		tree, errParse := parser.Parse(filterString)
+		if errParse != nil {
+			err := fmt.Errorf("err parsing filter '%s': %v", ast.ToPreOrderShortString(tree), errParse)
+			http.Error(w, fmt.Sprintf("Invalid 'filter' parameter: %s", err), http.StatusBadRequest)
+		}
+		// todo: labelconfig?
+		compiler := opencost.NewAllocationMatchCompiler(nil)
+		var err error
+		filter, err = compiler.Compile(tree)
+		if err != nil {
+			err := fmt.Errorf("err compiling filter '%s': %v", ast.ToPreOrderShortString(tree), err)
+			http.Error(w, fmt.Sprintf("Invalid 'filter' parameter: %s", err), http.StatusBadRequest)
+		}
+	}
+	if filter == nil {
+		err := fmt.Errorf("unexpected nil filter")
+		http.Error(w, fmt.Sprintf("Invalid 'filter' parameter: %s", err), http.StatusBadRequest)
 	}
 
 	// Resolution is an optional parameter, defaulting to the configured ETL
@@ -2297,6 +2350,13 @@ func (a *Accesses) ComputeAllocationHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	for _, as := range asr.Allocations {
+		for key, alloc := range as.Allocations {
+			if !filter.Matches(alloc) {
+				delete(as.Allocations, key)
+			}
+		}
+	}
 	w.Write(WrapData(asr, nil))
 }
 
