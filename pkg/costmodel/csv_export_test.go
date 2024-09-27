@@ -66,8 +66,8 @@ func Test_UpdateCSV(t *testing.T) {
 		assert.Len(t, model.ComputeAllocationCalls(), 1)
 		assert.Equal(t, time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC), model.ComputeAllocationCalls()[0].Start)
 		assert.Equal(t, time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC), model.ComputeAllocationCalls()[0].End)
-		assert.Equal(t, `Date,Namespace,ControllerKind,ControllerName,Pod,Container,CPUCoreUsageAverage,CPUCoreRequestAverage,RAMBytesUsageAverage,RAMBytesRequestAverage,NetworkReceiveBytes,NetworkTransferBytes,GPUs,PVBytes,CPUCost,RAMCost,NetworkCost,PVCost,GPUCost,TotalCost
-2021-01-01,test-namespace,test-controller-kind,test-controller-name,test-pod,test-container,0.1,0.2,0.4,0.5,11,10,2,2,0.3,0.6,0.9,2,0.8,4.6000000000000005
+		assert.Equal(t, `Date,Cluster,Namespace,ControllerKind,ControllerName,Pod,Container,CPUCoreUsageAverage,CPUCoreRequestAverage,RAMBytesUsageAverage,RAMBytesRequestAverage,NetworkReceiveBytes,NetworkTransferBytes,GPUs,PVBytes,CPUCost,RAMCost,NetworkCost,PVCost,GPUCost,TotalCost
+2021-01-01,,test-namespace,test-controller-kind,test-controller-name,test-pod,test-container,0.1,0.2,0.4,0.5,11,10,2,2,0.3,0.6,0.9,2,0.8,4.6000000000000005
 `, string(storage.Data))
 	})
 
@@ -101,15 +101,15 @@ func Test_UpdateCSV(t *testing.T) {
 		require.NoError(t, err)
 		// uploaded a single file with the data
 		assert.Len(t, model.ComputeAllocationCalls(), 1)
-		assert.Equal(t, `Date,Namespace,ControllerKind,ControllerName,Pod,Container,CPUCoreUsageAverage,CPUCoreRequestAverage,RAMBytesUsageAverage,RAMBytesRequestAverage,NetworkReceiveBytes,NetworkTransferBytes,GPUs,PVBytes,CPUCost,RAMCost,NetworkCost,PVCost,GPUCost,TotalCost,Labels,Label_test-label1,Label_test-label2
-2021-01-01,test-namespace,test-controller-kind,test-controller-name,test-pod,test-container,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"{""test-label1"":""test-value1"",""test-label2"":""test-value2""}",test-value1,test-value2
+		assert.Equal(t, `Date,Cluster,Namespace,ControllerKind,ControllerName,Pod,Container,CPUCoreUsageAverage,CPUCoreRequestAverage,RAMBytesUsageAverage,RAMBytesRequestAverage,NetworkReceiveBytes,NetworkTransferBytes,GPUs,PVBytes,CPUCost,RAMCost,NetworkCost,PVCost,GPUCost,TotalCost,Labels,Label_test-label1,Label_test-label2
+2021-01-01,,test-namespace,test-controller-kind,test-controller-name,test-pod,test-container,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"{""test-label1"":""test-value1"",""test-label2"":""test-value2""}",test-value1,test-value2
 `, string(storage.Data))
 	})
 
 	t.Run("merge new data with previous data (with different CSV structure)", func(t *testing.T) {
 		storage := &filemanager.InMemoryFile{
-			Data: []byte(`Date,Namespace,CPUCoreUsageAverage,CPUCoreRequestAverage,CPUCost,RAMBytesUsageAverage,RAMBytesRequestAverage,RAMCost,Label_app
-2021-01-01,test-namespace,0.1,0.2,0.3,0.4,0.5,0.6,app1
+			Data: []byte(`Date,Cluster,Namespace,CPUCoreUsageAverage,CPUCoreRequestAverage,CPUCost,RAMBytesUsageAverage,RAMBytesRequestAverage,RAMCost,Label_app
+2021-01-01,,test-namespace,0.1,0.2,0.3,0.4,0.5,0.6,app1
 `),
 		}
 		model := &AllocationModelMock{
@@ -137,9 +137,9 @@ func Test_UpdateCSV(t *testing.T) {
 		// 2021-01-01 is already in the export file, so we only compute for 2021-01-02
 		assert.Equal(t, time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC), model.ComputeAllocationCalls()[0].Start)
 		assert.Equal(t, time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC), model.ComputeAllocationCalls()[0].End)
-		assert.Equal(t, `Date,Namespace,CPUCoreUsageAverage,CPUCoreRequestAverage,CPUCost,RAMBytesUsageAverage,RAMBytesRequestAverage,RAMCost,Label_app,ControllerKind,ControllerName,Pod,Container,NetworkReceiveBytes,NetworkTransferBytes,GPUs,PVBytes,NetworkCost,PVCost,GPUCost,TotalCost
-2021-01-01,test-namespace,0.1,0.2,0.3,0.4,0.5,0.6,app1,,,,,,,,,,,,
-2021-01-02,test-namespace,0,0,1,0,0,0,,,,,,0,0,0,0,0,0,0,1
+		assert.Equal(t, `Date,Cluster,Namespace,CPUCoreUsageAverage,CPUCoreRequestAverage,CPUCost,RAMBytesUsageAverage,RAMBytesRequestAverage,RAMCost,Label_app,ControllerKind,ControllerName,Pod,Container,NetworkReceiveBytes,NetworkTransferBytes,GPUs,PVBytes,NetworkCost,PVCost,GPUCost,TotalCost
+2021-01-01,,test-namespace,0.1,0.2,0.3,0.4,0.5,0.6,app1,,,,,,,,,,,,
+2021-01-02,,test-namespace,0,0,1,0,0,0,,,,,,0,0,0,0,0,0,0,1
 `, string(storage.Data))
 	})
 
