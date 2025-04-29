@@ -571,7 +571,7 @@ func (a *Accesses) GetAllNodePricing(w http.ResponseWriter, r *http.Request, ps 
 	w.Write(WrapData(data, err))
 }
 
-func (a *Accesses) GetConfigs(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (a *Accesses) GetCustomPricing(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	data, err := a.CloudProvider.GetConfig()
@@ -1421,6 +1421,7 @@ func Initialize(router *httprouter.Router, additionalConfigWatchers ...*watcher.
 	router.GET("/allocation/compute", a.ComputeAllocationHandler)
 	router.GET("/allocation/compute/summary", a.ComputeAllocationHandlerSummary)
 	router.GET("/allNodePricing", a.GetAllNodePricing)
+	router.GET("/customPricing", a.GetCustomPricing)
 	router.POST("/refreshPricing", a.RefreshPricingData)
 	router.GET("/clusterCostsOverTime", a.ClusterCostsOverTime)
 	router.GET("/clusterCosts", a.ClusterCosts)
