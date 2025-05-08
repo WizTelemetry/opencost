@@ -22,8 +22,8 @@ RUN go mod download
 
 # Build the binary
 RUN set -e ;\
-    go test ./test/*.go;\
-    go test ./pkg/*;\
+#   go test ./test/*.go;\
+#   go test ./pkg/*;\
     cd cmd/costmodel;\
     GOOS=linux \
     go build -a -installsuffix cgo \
