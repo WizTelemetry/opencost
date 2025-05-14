@@ -49,6 +49,14 @@ func InitLogging(showLogLevelSetMessage bool) {
 
 }
 
+func GetLogger() *zerolog.Logger {
+	return &log.Logger
+}
+
+func SetLogger(l *zerolog.Logger) {
+	log.Logger = *l
+}
+
 func GetLogLevel() string {
 	return zerolog.GlobalLevel().String()
 }
@@ -65,6 +73,10 @@ func SetLogLevel(l string) error {
 	return nil
 }
 
+func Error(msg string) {
+	log.Error().Msg(msg)
+}
+
 func Errorf(format string, a ...interface{}) {
 	log.Error().Msgf(format, a...)
 }
@@ -78,6 +90,10 @@ func DedupedErrorf(logTypeLimit int, format string, a ...interface{}) {
 		Errorf(format, a...)
 		Infof("%s logged %d times: suppressing future logs", fmt.Sprintf(format, a...), logTypeLimit)
 	}
+}
+
+func Warn(msg string) {
+	log.Warn().Msg(msg)
 }
 
 func Warnf(format string, a ...interface{}) {
@@ -132,6 +148,10 @@ func Trace(msg string) {
 
 func Tracef(format string, a ...interface{}) {
 	log.Trace().Msgf(format, a...)
+}
+
+func Fatal(msg string) {
+	log.Fatal().Msg(msg)
 }
 
 func Fatalf(format string, a ...interface{}) {

@@ -9,7 +9,6 @@ import (
 
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/opencost"
-	"github.com/opencost/opencost/core/pkg/util/promutil"
 	"github.com/opencost/opencost/core/pkg/util/timeutil"
 	"github.com/opencost/opencost/pkg/cloud/provider"
 	"github.com/opencost/opencost/pkg/env"
@@ -28,6 +27,13 @@ const GiB = 1024.0 * MiB
 const TiB = 1024.0 * GiB
 const PiB = 1024.0 * TiB
 const PV_USAGE_SANITY_LIMIT_BYTES = 10.0 * PiB
+
+const (
+	GpuUsageAverageMode = "AVERAGE"
+	GpuUsageMaxMode     = "MAX"
+	GpuIsSharedMode     = "SHARED"
+	GpuInfoMode         = "GPU_INFO"
+)
 
 /* Pod Helpers */
 
@@ -614,12 +620,13 @@ func applyRAMBytesUsedMax(podMap map[podKey]*pod, resRAMBytesUsedMax []*prom.Que
 	}
 }
 
-func applyGPUUsageAvg(podMap map[podKey]*pod, resGPUUsageAvg []*prom.QueryResult, podUIDKeyMap map[podKey][]podKey) {
+// same func is used for both GPUUsageAvg and GPUUsageMax
+func applyGPUUsage(podMap map[podKey]*pod, resGPUUsageAvgOrMax []*prom.QueryResult, podUIDKeyMap map[podKey][]podKey, mode string) {
 	// Example PromQueryResult: {container="dcgmproftester12", namespace="gpu", pod="dcgmproftester3-deployment-fc89c8dd6-ph7z5"} 0.997307
-	for _, res := range resGPUUsageAvg {
+	for _, res := range resGPUUsageAvgOrMax {
 		key, err := resultPodKey(res, env.GetPromClusterLabel(), "namespace")
 		if err != nil {
-			log.DedupedWarningf(10, "CostModel.ComputeAllocation: GPU usage avg result missing field: %s", err)
+			log.DedupedWarningf(10, "CostModel.ComputeAllocation: GPU usage avg/max result missing field: %s", err)
 			continue
 		}
 
@@ -642,7 +649,7 @@ func applyGPUUsageAvg(podMap map[podKey]*pod, resGPUUsageAvg []*prom.QueryResult
 		for _, thisPod := range pods {
 			container, err := res.GetString("container")
 			if err != nil {
-				log.DedupedWarningf(10, "CostModel.ComputeAllocation: GPU usage avg query result missing 'container': %s", key)
+				log.DedupedWarningf(10, "CostModel.ComputeAllocation: GPU usage avg/max query result missing 'container': %s", key)
 				continue
 			}
 			if _, ok := thisPod.Allocations[container]; !ok {
@@ -650,7 +657,64 @@ func applyGPUUsageAvg(podMap map[podKey]*pod, resGPUUsageAvg []*prom.QueryResult
 			}
 
 			// DCGM_FI_PROF_GR_ENGINE_ACTIVE metric is a float between 0-1.
-			thisPod.Allocations[container].GPUUsageAverage = res.Values[0].Value
+			switch mode {
+			case GpuUsageAverageMode:
+
+				if thisPod.Allocations[container].GPUAllocation == nil {
+					thisPod.Allocations[container].GPUAllocation = &opencost.GPUAllocation{GPUUsageAverage: &res.Values[0].Value}
+				} else {
+					thisPod.Allocations[container].GPUAllocation.GPUUsageAverage = &res.Values[0].Value
+				}
+			case GpuUsageMaxMode:
+				if thisPod.Allocations[container].RawAllocationOnly == nil {
+					thisPod.Allocations[container].RawAllocationOnly = &opencost.RawAllocationOnlyData{
+						GPUUsageMax: &res.Values[0].Value,
+					}
+				} else {
+					thisPod.Allocations[container].RawAllocationOnly.GPUUsageMax = &res.Values[0].Value
+				}
+			case GpuIsSharedMode:
+				// if a container is using a GPU and it is shared, isGPUShared will be true
+				// if a container is using GPU and it is NOT shared, isGPUShared will be false
+				// if a container is NOT using a GPU, isGPUShared will be null
+				if res.Metric["resource"] == "nvidia_com_gpu_shared" {
+					trueVal := true
+					if res.Values[0].Value == 1 {
+						if thisPod.Allocations[container].GPUAllocation == nil {
+
+							thisPod.Allocations[container].GPUAllocation = &opencost.GPUAllocation{IsGPUShared: &trueVal}
+						} else {
+							thisPod.Allocations[container].GPUAllocation.IsGPUShared = &trueVal
+						}
+					}
+				} else if res.Metric["resource"] == "nvidia_com_gpu" {
+					falseVal := false
+					if res.Values[0].Value == 1 {
+						if thisPod.Allocations[container].GPUAllocation == nil {
+							thisPod.Allocations[container].GPUAllocation = &opencost.GPUAllocation{IsGPUShared: &falseVal}
+						} else {
+							thisPod.Allocations[container].GPUAllocation.IsGPUShared = &falseVal
+						}
+					}
+				} else {
+					continue
+				}
+			case GpuInfoMode:
+				if thisPod.Allocations[container].GPUAllocation == nil {
+					thisPod.Allocations[container].GPUAllocation = &opencost.GPUAllocation{
+						GPUDevice: getSanitizedDeviceName(fmt.Sprintf("%s", res.Metric["device_name"])),
+						GPUModel:  fmt.Sprintf("%s", res.Metric["modelName"]),
+						GPUUUID:   fmt.Sprintf("%s", res.Metric["UUID"]),
+					}
+				} else {
+					thisPod.Allocations[container].GPUAllocation.GPUDevice = getSanitizedDeviceName(fmt.Sprintf("%s", res.Metric["device"]))
+					thisPod.Allocations[container].GPUAllocation.GPUModel = fmt.Sprintf("%s", res.Metric["modelName"])
+					thisPod.Allocations[container].GPUAllocation.GPUUUID = fmt.Sprintf("%s", res.Metric["UUID"])
+				}
+
+			default:
+				log.DedupedInfof(10, "CostModel.ComputeAllocation: Unknown mode: %s", mode)
+			}
 		}
 	}
 }
@@ -702,7 +766,14 @@ func applyGPUsAllocated(podMap map[podKey]*pod, resGPUsRequested []*prom.QueryRe
 			// Therefore max(usage,request) will always equal request. In the
 			// future this may need to be refactored when building support for
 			// GPU Time Slicing.
-			thisPod.Allocations[container].GPURequestAverage = res.Values[0].Value
+
+			if thisPod.Allocations[container].GPUAllocation == nil {
+				thisPod.Allocations[container].GPUAllocation = &opencost.GPUAllocation{
+					GPURequestAverage: &res.Values[0].Value,
+				}
+			} else {
+				thisPod.Allocations[container].GPUAllocation.GPURequestAverage = &res.Values[0].Value
+			}
 		}
 	}
 }
@@ -840,23 +911,11 @@ func resToNodeLabels(resNodeLabels []*prom.QueryResult) map[nodeKey]map[string]s
 			nodeLabels[nodeKey] = map[string]string{}
 		}
 
-		for _, rawK := range env.GetAllocationNodeLabelsIncludeList() {
-			labels := res.GetLabels()
-
-			// Sanitize the given label name to match Prometheus formatting
-			// e.g. topology.kubernetes.io/zone => topology_kubernetes_io_zone
-			k := promutil.SanitizeLabelName(rawK)
-			if v, ok := labels[k]; ok {
-				nodeLabels[nodeKey][k] = v
-				continue
-			}
-
-			// Try with the "label_" prefix, if not found
-			// e.g. topology_kubernetes_io_zone => label_topology_kubernetes_io_zone
-			k = fmt.Sprintf("label_%s", k)
-			if v, ok := labels[k]; ok {
-				nodeLabels[nodeKey][k] = v
-			}
+		labels := res.GetLabels()
+		// labels are retrieved from prometheus here so it will be in prometheus sanitized state
+		// e.g. topology.kubernetes.io/zone => topology_kubernetes_io_zone
+		for labelKey, labelValue := range labels {
+			nodeLabels[nodeKey][labelKey] = labelValue
 		}
 	}
 
@@ -1399,7 +1458,6 @@ func getLoadBalancerCosts(lbMap map[serviceKey]*lbCost, resLBCost, resLBActiveMi
 			continue
 		}
 
-		// load balancers have interpolation for costs, we don't need to offset the resolution
 		lbStart, lbEnd := calculateStartAndEnd(res, resolution, window)
 		if lbStart.IsZero() || lbEnd.IsZero() {
 			log.Warnf("CostModel.ComputeAllocation: pvc %s has no running time", serviceKey)
@@ -2294,17 +2352,19 @@ func getUnmountedPodForNamespace(window opencost.Window, podMap map[podKey]*pod,
 
 func calculateStartAndEnd(result *prom.QueryResult, resolution time.Duration, window opencost.Window) (time.Time, time.Time) {
 	// Start and end for a range vector are pulled from the timestamps of the
-	// first and final values in the range. There is no "offsetting" required
-	// of the start or the end, as we used to do. If you query for a duration
-	// of time that is divisible by the given resolution, and set the end time
-	// to be precisely the end of the window, Prometheus should give all the
-	// relevant timestamps.
-	//
-	// E.g. avg(kube_pod_container_status_running{}) by (pod, namespace)[1h:1m]
-	// with time=01:00:00 will return, for a pod running the entire time,
-	// 61 timestamps where the first is 00:00:00 and the last is 01:00:00.
+	// first and final values in the range.
 	s := time.Unix(int64(result.Values[0].Timestamp), 0).UTC()
 	e := time.Unix(int64(result.Values[len(result.Values)-1].Timestamp), 0).UTC()
+
+	// As of Prometheus v3, we have had to reintroduce the "offsetting" of the
+	// start time.
+	//
+	// E.g. avg(node_total_hourly_cost{}) by (node, provider_id)[1h:5m] with
+	// time=01:00:00 will return, for a node running the entire time, 12
+	// timestamps where the first is 00:05:00 and the last is 01:00:00.
+	if IsPrometheusVersionGTE3() {
+		s = s.Add(-resolution)
+	}
 
 	// The only corner-case here is what to do if you only get one timestamp.
 	// This dilemma still requires the use of the resolution, and can be
@@ -2323,4 +2383,12 @@ func calculateStartAndEnd(result *prom.QueryResult, resolution time.Duration, wi
 	}
 
 	return s, e
+}
+
+func getSanitizedDeviceName(deviceName string) string {
+	if strings.Contains(deviceName, "nvidia") {
+		return "nvidia"
+	}
+
+	return deviceName
 }

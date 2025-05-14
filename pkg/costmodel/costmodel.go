@@ -356,7 +356,7 @@ func (cm *CostModel) ComputeCostData(cli prometheusClient.Client, cp costAnalyze
 	for key := range CPUUsedMap {
 		containers[key] = true
 	}
-	currentContainers := make(map[string]v1.Pod)
+	currentContainers := make(map[string]clustercache.Pod)
 	for _, pod := range podlist {
 		if pod.Status.Phase != v1.PodRunning {
 			continue
@@ -380,11 +380,11 @@ func (cm *CostModel) ComputeCostData(cli prometheusClient.Client, cp costAnalyze
 		// deleted so we have usage information but not request information. In that case,
 		// we return partial data for CPU and RAM: only usage and not requests.
 		if pod, ok := currentContainers[key]; ok {
-			podName := pod.GetObjectMeta().GetName()
-			ns := pod.GetObjectMeta().GetNamespace()
+			podName := pod.Name
+			ns := pod.Namespace
 
 			nsLabels := namespaceLabelsMapping[ns+","+clusterID]
-			podLabels := pod.GetObjectMeta().GetLabels()
+			podLabels := pod.Labels
 			if podLabels == nil {
 				podLabels = make(map[string]string)
 			}
@@ -396,7 +396,7 @@ func (cm *CostModel) ComputeCostData(cli prometheusClient.Client, cp costAnalyze
 			}
 
 			nsAnnotations := namespaceAnnotationsMapping[ns+","+clusterID]
-			podAnnotations := pod.GetObjectMeta().GetAnnotations()
+			podAnnotations := pod.Annotations
 			if podAnnotations == nil {
 				podAnnotations = make(map[string]string)
 			}
@@ -417,7 +417,7 @@ func (cm *CostModel) ComputeCostData(cli prometheusClient.Client, cp costAnalyze
 
 			var podDeployments []string
 			if _, ok := podDeploymentsMapping[nsKey]; ok {
-				if ds, ok := podDeploymentsMapping[nsKey][pod.GetObjectMeta().GetName()]; ok {
+				if ds, ok := podDeploymentsMapping[nsKey][pod.Name]; ok {
 					podDeployments = ds
 				} else {
 					podDeployments = []string{}
@@ -452,7 +452,7 @@ func (cm *CostModel) ComputeCostData(cli prometheusClient.Client, cp costAnalyze
 
 			var podServices []string
 			if _, ok := podServicesMapping[nsKey]; ok {
-				if svcs, ok := podServicesMapping[nsKey][pod.GetObjectMeta().GetName()]; ok {
+				if svcs, ok := podServicesMapping[nsKey][pod.Name]; ok {
 					podServices = svcs
 				} else {
 					podServices = []string{}
@@ -902,8 +902,8 @@ func addPVData(cache clustercache.ClusterCache, pvClaimMapping map[string]*Persi
 	storageClassMap := make(map[string]map[string]string)
 	for _, storageClass := range storageClasses {
 		params := storageClass.Parameters
-		storageClassMap[storageClass.ObjectMeta.Name] = params
-		if storageClass.GetAnnotations()["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.GetAnnotations()["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
+		storageClassMap[storageClass.Name] = params
+		if storageClass.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
 			storageClassMap["default"] = params
 			storageClassMap[""] = params
 		}
@@ -949,7 +949,7 @@ func addPVData(cache clustercache.ClusterCache, pvClaimMapping map[string]*Persi
 	return nil
 }
 
-func GetPVCost(pv *costAnalyzerCloud.PV, kpv *v1.PersistentVolume, cp costAnalyzerCloud.Provider, defaultRegion string) error {
+func GetPVCost(pv *costAnalyzerCloud.PV, kpv *clustercache.PersistentVolume, cp costAnalyzerCloud.Provider, defaultRegion string) error {
 	cfg, err := cp.GetConfig()
 	if err != nil {
 		return err
@@ -991,9 +991,9 @@ func (cm *CostModel) GetNodeCost(cp costAnalyzerCloud.Provider) (map[string]*cos
 		PricingTypeCounts: make(map[costAnalyzerCloud.PricingType]int),
 	}
 	for _, n := range nodeList {
-		name := n.GetObjectMeta().GetName()
-		nodeLabels := n.GetObjectMeta().GetLabels()
-		nodeLabels["providerID"] = n.Spec.ProviderID
+		name := n.Name
+		nodeLabels := n.Labels
+		nodeLabels["providerID"] = n.SpecProviderID
 
 		pmd.TotalNodes++
 
@@ -1032,7 +1032,7 @@ func (cm *CostModel) GetNodeCost(cp costAnalyzerCloud.Provider) (map[string]*cos
 			arch, _ := util.GetArchType(n.Labels)
 			newCnode.ArchType = arch
 		}
-		newCnode.ProviderID = n.Spec.ProviderID
+		newCnode.ProviderID = n.SpecProviderID
 
 		var cpu float64
 		if newCnode.VCPU == "" {
@@ -1100,6 +1100,38 @@ func (cm *CostModel) GetNodeCost(cp costAnalyzerCloud.Provider) (map[string]*cos
 				defaultCPUCorePrice = 0
 			}
 
+			// Some customers may want GPU pricing to be determined by the labels affixed to their nodes. GpuPricing
+			// passes the node's labels to the provider, which then cross-references them with the labels that the
+			// provider knows to have label-specific costs associated with them, and returns that cost. See CSVProvider
+			// for an example implementation.
+			var gpuPrice float64
+			gpuPricing, err := cp.GpuPricing(nodeLabels)
+			if err != nil {
+				log.Errorf("Could not determine custom GPU pricing: %s", err)
+				gpuPrice = 0
+			} else if len(gpuPricing) > 0 {
+				gpuPrice, err = strconv.ParseFloat(gpuPricing, 64)
+				if err != nil {
+					log.Errorf("Could not parse custom GPU pricing: %s", err)
+					gpuPrice = 0
+				} else if math.IsNaN(gpuPrice) {
+					log.Warnf("Custom GPU pricing parsed as NaN. Setting to 0.")
+					gpuPrice = 0
+				} else {
+					log.Infof("Using custom GPU pricing for node \"%s\": %f", name, gpuPrice)
+				}
+			} else {
+				gpuPrice, err = strconv.ParseFloat(cfg.GPU, 64)
+				if err != nil {
+					log.Errorf("Could not parse default gpu price")
+					gpuPrice = 0
+				}
+				if math.IsNaN(gpuPrice) {
+					log.Warnf("defaultGPU parsed as NaN. Setting to 0.")
+					gpuPrice = 0
+				}
+			}
+
 			defaultRAMPrice, err := strconv.ParseFloat(cfg.RAM, 64)
 			if err != nil {
 				log.Errorf("Could not parse default ram price")
@@ -1121,13 +1153,13 @@ func (cm *CostModel) GetNodeCost(cp costAnalyzerCloud.Provider) (map[string]*cos
 			}
 			// Just say no to doing the ratios!
 			cpuCost := defaultCPUCorePrice * cpu
-			gpuCost := defaultGPUPrice * gpuc
+			gpuCost := gpuPrice * gpuc
 			ramCost := defaultRAMPrice * ram
 			nodeCost := cpuCost + gpuCost + ramCost
 
 			newCnode.Cost = fmt.Sprintf("%f", nodeCost)
 			newCnode.VCPUCost = fmt.Sprintf("%f", defaultCPUCorePrice)
-			newCnode.GPUCost = fmt.Sprintf("%f", defaultGPUPrice)
+			newCnode.GPUCost = fmt.Sprintf("%f", gpuPrice)
 			newCnode.RAMCost = fmt.Sprintf("%f", defaultRAMPrice)
 			newCnode.RAMBytes = fmt.Sprintf("%f", ram)
 
@@ -1141,95 +1173,109 @@ func (cm *CostModel) GetNodeCost(cp costAnalyzerCloud.Provider) (map[string]*cos
 			// cost among the CPU, RAM, and GPU.
 			log.Tracef("GPU without cost found for %s, calculating...", cp.GetKey(nodeLabels, n).Features())
 
-			defaultCPU, err := strconv.ParseFloat(cfg.CPU, 64)
+			// Some customers may want GPU pricing to be determined by the labels affixed to their nodes. GpuPricing
+			// passes the node's labels to the provider, which then cross-references them with the labels that the
+			// provider knows to have label-specific costs associated with them, and returns that cost. See CSVProvider
+			// for an example implementation.
+			gpuPricing, err := cp.GpuPricing(nodeLabels)
 			if err != nil {
-				log.Errorf("Could not parse default cpu price")
-				defaultCPU = 0
-			}
-			if math.IsNaN(defaultCPU) {
-				log.Warnf("defaultCPU parsed as NaN. Setting to 0.")
-				defaultCPU = 0
+				log.Errorf("Could not determine custom GPU pricing: %s", err)
+			} else if len(gpuPricing) > 0 {
+				newCnode.GPUCost = gpuPricing
+				log.Infof("Using custom GPU pricing for node \"%s\": %s", name, gpuPricing)
 			}
 
-			defaultRAM, err := strconv.ParseFloat(cfg.RAM, 64)
-			if err != nil {
-				log.Errorf("Could not parse default ram price")
-				defaultRAM = 0
-			}
-			if math.IsNaN(defaultRAM) {
-				log.Warnf("defaultRAM parsed as NaN. Setting to 0.")
-				defaultRAM = 0
-			}
-
-			defaultGPU, err := strconv.ParseFloat(cfg.GPU, 64)
-			if err != nil {
-				log.Errorf("Could not parse default gpu price")
-				defaultGPU = 0
-			}
-			if math.IsNaN(defaultGPU) {
-				log.Warnf("defaultGPU parsed as NaN. Setting to 0.")
-				defaultGPU = 0
-			}
-
-			cpuToRAMRatio := defaultCPU / defaultRAM
-			if math.IsNaN(cpuToRAMRatio) {
-				log.Warnf("cpuToRAMRatio[defaultCPU: %f / defaultRAM: %f] is NaN. Setting to 10.", defaultCPU, defaultRAM)
-				cpuToRAMRatio = 10
-			}
-
-			gpuToRAMRatio := defaultGPU / defaultRAM
-			if math.IsNaN(gpuToRAMRatio) {
-				log.Warnf("gpuToRAMRatio is NaN. Setting to 100.")
-				gpuToRAMRatio = 100
-			}
-
-			ramGB := ram / 1024 / 1024 / 1024
-			if math.IsNaN(ramGB) {
-				log.Warnf("ramGB is NaN. Setting to 0.")
-				ramGB = 0
-			}
-
-			ramMultiple := gpuc*gpuToRAMRatio + cpu*cpuToRAMRatio + ramGB
-			if math.IsNaN(ramMultiple) {
-				log.Warnf("ramMultiple is NaN. Setting to 0.")
-				ramMultiple = 0
-			}
-
-			var nodePrice float64
-			if newCnode.Cost != "" {
-				nodePrice, err = strconv.ParseFloat(newCnode.Cost, 64)
+			if newCnode.GPUCost == "" {
+				defaultCPU, err := strconv.ParseFloat(cfg.CPU, 64)
 				if err != nil {
-					log.Errorf("Could not parse total node price")
-					return nil, err
+					log.Errorf("Could not parse default cpu price")
+					defaultCPU = 0
 				}
-			} else if newCnode.VCPUCost != "" {
-				nodePrice, err = strconv.ParseFloat(newCnode.VCPUCost, 64) // all the price was allocated to the CPU
+				if math.IsNaN(defaultCPU) {
+					log.Warnf("defaultCPU parsed as NaN. Setting to 0.")
+					defaultCPU = 0
+				}
+
+				defaultRAM, err := strconv.ParseFloat(cfg.RAM, 64)
 				if err != nil {
-					log.Errorf("Could not parse node vcpu price")
-					return nil, err
+					log.Errorf("Could not parse default ram price")
+					defaultRAM = 0
 				}
-			} else { // add case to use default pricing model when API data fails.
-				log.Debugf("No node price or CPUprice found, falling back to default")
-				nodePrice = defaultCPU*cpu + defaultRAM*ram + gpuc*defaultGPU
-			}
-			if math.IsNaN(nodePrice) {
-				log.Warnf("nodePrice parsed as NaN. Setting to 0.")
-				nodePrice = 0
-			}
+				if math.IsNaN(defaultRAM) {
+					log.Warnf("defaultRAM parsed as NaN. Setting to 0.")
+					defaultRAM = 0
+				}
 
-			ramPrice := (nodePrice / ramMultiple)
-			if math.IsNaN(ramPrice) {
-				log.Warnf("ramPrice[nodePrice: %f / ramMultiple: %f] parsed as NaN. Setting to 0.", nodePrice, ramMultiple)
-				ramPrice = 0
+				defaultGPU, err := strconv.ParseFloat(cfg.GPU, 64)
+				if err != nil {
+					log.Errorf("Could not parse default gpu price")
+					defaultGPU = 0
+				}
+				if math.IsNaN(defaultGPU) {
+					log.Warnf("defaultGPU parsed as NaN. Setting to 0.")
+					defaultGPU = 0
+				}
+
+				cpuToRAMRatio := defaultCPU / defaultRAM
+				if math.IsNaN(cpuToRAMRatio) {
+					log.Warnf("cpuToRAMRatio[defaultCPU: %f / defaultRAM: %f] is NaN. Setting to 10.", defaultCPU, defaultRAM)
+					cpuToRAMRatio = 10
+				}
+
+				gpuToRAMRatio := defaultGPU / defaultRAM
+				if math.IsNaN(gpuToRAMRatio) {
+					log.Warnf("gpuToRAMRatio is NaN. Setting to 100.")
+					gpuToRAMRatio = 100
+				}
+
+				ramGB := ram / 1024 / 1024 / 1024
+				if math.IsNaN(ramGB) {
+					log.Warnf("ramGB is NaN. Setting to 0.")
+					ramGB = 0
+				}
+
+				ramMultiple := gpuc*gpuToRAMRatio + cpu*cpuToRAMRatio + ramGB
+				if math.IsNaN(ramMultiple) {
+					log.Warnf("ramMultiple is NaN. Setting to 0.")
+					ramMultiple = 0
+				}
+
+				var nodePrice float64
+				if newCnode.Cost != "" {
+					nodePrice, err = strconv.ParseFloat(newCnode.Cost, 64)
+					if err != nil {
+						log.Errorf("Could not parse total node price")
+						return nil, err
+					}
+				} else if newCnode.VCPUCost != "" {
+					nodePrice, err = strconv.ParseFloat(newCnode.VCPUCost, 64) // all the price was allocated to the CPU
+					if err != nil {
+						log.Errorf("Could not parse node vcpu price")
+						return nil, err
+					}
+				} else { // add case to use default pricing model when API data fails.
+					log.Debugf("No node price or CPUprice found, falling back to default")
+					nodePrice = defaultCPU*cpu + defaultRAM*ram + gpuc*defaultGPU
+				}
+				if math.IsNaN(nodePrice) {
+					log.Warnf("nodePrice parsed as NaN. Setting to 0.")
+					nodePrice = 0
+				}
+
+				ramPrice := (nodePrice / ramMultiple)
+				if math.IsNaN(ramPrice) {
+					log.Warnf("ramPrice[nodePrice: %f / ramMultiple: %f] parsed as NaN. Setting to 0.", nodePrice, ramMultiple)
+					ramPrice = 0
+				}
+
+				cpuPrice := ramPrice * cpuToRAMRatio
+				gpuPrice := ramPrice * gpuToRAMRatio
+
+				newCnode.VCPUCost = fmt.Sprintf("%f", cpuPrice)
+				newCnode.RAMCost = fmt.Sprintf("%f", ramPrice)
+				newCnode.RAMBytes = fmt.Sprintf("%f", ram)
+				newCnode.GPUCost = fmt.Sprintf("%f", gpuPrice)
 			}
-
-			cpuPrice := ramPrice * cpuToRAMRatio
-			gpuPrice := ramPrice * gpuToRAMRatio
-
-			newCnode.VCPUCost = fmt.Sprintf("%f", cpuPrice)
-			newCnode.RAMCost = fmt.Sprintf("%f", ramPrice)
-			newCnode.RAMBytes = fmt.Sprintf("%f", ram)
-			newCnode.GPUCost = fmt.Sprintf("%f", gpuPrice)
 		} else if newCnode.RAMCost == "" {
 			// We reach this when no RAM cost is defined in the OnDemand
 			// pricing. It calculates a cpuToRAMRatio and ramMultiple to
@@ -1347,15 +1393,15 @@ func (cm *CostModel) GetLBCost(cp costAnalyzerCloud.Provider) (map[serviceKey]*c
 	loadBalancerMap := make(map[serviceKey]*costAnalyzerCloud.LoadBalancer)
 
 	for _, service := range servicesList {
-		namespace := service.GetObjectMeta().GetNamespace()
-		name := service.GetObjectMeta().GetName()
+		namespace := service.Namespace
+		name := service.Name
 		key := serviceKey{
 			Cluster:   env.GetClusterID(),
 			Namespace: namespace,
 			Service:   name,
 		}
 
-		if service.Spec.Type == "LoadBalancer" {
+		if service.Type == "LoadBalancer" {
 			loadBalancer, err := cp.LoadBalancerPricing()
 			if err != nil {
 				return nil, err
@@ -1376,28 +1422,28 @@ func (cm *CostModel) GetLBCost(cp costAnalyzerCloud.Provider) (map[serviceKey]*c
 	return loadBalancerMap, nil
 }
 
-func getPodServices(cache clustercache.ClusterCache, podList []*v1.Pod, clusterID string) (map[string]map[string][]string, error) {
+func getPodServices(cache clustercache.ClusterCache, podList []*clustercache.Pod, clusterID string) (map[string]map[string][]string, error) {
 	servicesList := cache.GetAllServices()
 	podServicesMapping := make(map[string]map[string][]string)
 	for _, service := range servicesList {
-		namespace := service.GetObjectMeta().GetNamespace()
-		name := service.GetObjectMeta().GetName()
+		namespace := service.Namespace
+		name := service.Name
 		key := namespace + "," + clusterID
 		if _, ok := podServicesMapping[key]; !ok {
 			podServicesMapping[key] = make(map[string][]string)
 		}
 		s := labels.Nothing()
-		if service.Spec.Selector != nil && len(service.Spec.Selector) > 0 {
-			s = labels.Set(service.Spec.Selector).AsSelectorPreValidated()
+		if service.SpecSelector != nil && len(service.SpecSelector) > 0 {
+			s = labels.Set(service.SpecSelector).AsSelectorPreValidated()
 		}
 		for _, pod := range podList {
-			labelSet := labels.Set(pod.GetObjectMeta().GetLabels())
-			if s.Matches(labelSet) && pod.GetObjectMeta().GetNamespace() == namespace {
-				services, ok := podServicesMapping[key][pod.GetObjectMeta().GetName()]
+			labelSet := labels.Set(pod.Labels)
+			if s.Matches(labelSet) && pod.Namespace == namespace {
+				services, ok := podServicesMapping[key][pod.Name]
 				if ok {
-					podServicesMapping[key][pod.GetObjectMeta().GetName()] = append(services, name)
+					podServicesMapping[key][pod.Name] = append(services, name)
 				} else {
-					podServicesMapping[key][pod.GetObjectMeta().GetName()] = []string{name}
+					podServicesMapping[key][pod.Name] = []string{name}
 				}
 			}
 		}
@@ -1405,29 +1451,29 @@ func getPodServices(cache clustercache.ClusterCache, podList []*v1.Pod, clusterI
 	return podServicesMapping, nil
 }
 
-func getPodStatefulsets(cache clustercache.ClusterCache, podList []*v1.Pod, clusterID string) (map[string]map[string][]string, error) {
+func getPodStatefulsets(cache clustercache.ClusterCache, podList []*clustercache.Pod, clusterID string) (map[string]map[string][]string, error) {
 	ssList := cache.GetAllStatefulSets()
 	podSSMapping := make(map[string]map[string][]string) // namespace: podName: [deploymentNames]
 	for _, ss := range ssList {
-		namespace := ss.GetObjectMeta().GetNamespace()
-		name := ss.GetObjectMeta().GetName()
+		namespace := ss.Namespace
+		name := ss.Name
 
 		key := namespace + "," + clusterID
 		if _, ok := podSSMapping[key]; !ok {
 			podSSMapping[key] = make(map[string][]string)
 		}
-		s, err := metav1.LabelSelectorAsSelector(ss.Spec.Selector)
+		s, err := metav1.LabelSelectorAsSelector(ss.SpecSelector)
 		if err != nil {
 			log.Errorf("Error doing deployment label conversion: " + err.Error())
 		}
 		for _, pod := range podList {
-			labelSet := labels.Set(pod.GetObjectMeta().GetLabels())
-			if s.Matches(labelSet) && pod.GetObjectMeta().GetNamespace() == namespace {
-				sss, ok := podSSMapping[key][pod.GetObjectMeta().GetName()]
+			labelSet := labels.Set(pod.Labels)
+			if s.Matches(labelSet) && pod.Namespace == namespace {
+				sss, ok := podSSMapping[key][pod.Name]
 				if ok {
-					podSSMapping[key][pod.GetObjectMeta().GetName()] = append(sss, name)
+					podSSMapping[key][pod.Name] = append(sss, name)
 				} else {
-					podSSMapping[key][pod.GetObjectMeta().GetName()] = []string{name}
+					podSSMapping[key][pod.Name] = []string{name}
 				}
 			}
 		}
@@ -1436,29 +1482,29 @@ func getPodStatefulsets(cache clustercache.ClusterCache, podList []*v1.Pod, clus
 
 }
 
-func getPodDeployments(cache clustercache.ClusterCache, podList []*v1.Pod, clusterID string) (map[string]map[string][]string, error) {
+func getPodDeployments(cache clustercache.ClusterCache, podList []*clustercache.Pod, clusterID string) (map[string]map[string][]string, error) {
 	deploymentsList := cache.GetAllDeployments()
 	podDeploymentsMapping := make(map[string]map[string][]string) // namespace: podName: [deploymentNames]
 	for _, deployment := range deploymentsList {
-		namespace := deployment.GetObjectMeta().GetNamespace()
-		name := deployment.GetObjectMeta().GetName()
+		namespace := deployment.Namespace
+		name := deployment.Name
 
 		key := namespace + "," + clusterID
 		if _, ok := podDeploymentsMapping[key]; !ok {
 			podDeploymentsMapping[key] = make(map[string][]string)
 		}
-		s, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+		s, err := metav1.LabelSelectorAsSelector(deployment.SpecSelector)
 		if err != nil {
 			log.Errorf("Error doing deployment label conversion: " + err.Error())
 		}
 		for _, pod := range podList {
-			labelSet := labels.Set(pod.GetObjectMeta().GetLabels())
-			if s.Matches(labelSet) && pod.GetObjectMeta().GetNamespace() == namespace {
-				deployments, ok := podDeploymentsMapping[key][pod.GetObjectMeta().GetName()]
+			labelSet := labels.Set(pod.Labels)
+			if s.Matches(labelSet) && pod.Namespace == namespace {
+				deployments, ok := podDeploymentsMapping[key][pod.Name]
 				if ok {
-					podDeploymentsMapping[key][pod.GetObjectMeta().GetName()] = append(deployments, name)
+					podDeploymentsMapping[key][pod.Name] = append(deployments, name)
 				} else {
-					podDeploymentsMapping[key][pod.GetObjectMeta().GetName()] = []string{name}
+					podDeploymentsMapping[key][pod.Name] = []string{name}
 				}
 			}
 		}
@@ -1580,8 +1626,8 @@ func pruneDuplicates(s []string) []string {
 	for _, v := range s {
 		if strings.Contains(v, "_") {
 			name := strings.Replace(v, "_", "-", -1)
-			if !m[name] {
-				m[name] = true
+			if _, found := m[name]; !found {
+				m[name] = struct{}{}
 			}
 			delete(m, v)
 		}
@@ -1590,16 +1636,16 @@ func pruneDuplicates(s []string) []string {
 	return setToSlice(m)
 }
 
-// Creates a map[string]bool containing the slice values as keys
-func sliceToSet(s []string) map[string]bool {
-	m := make(map[string]bool)
+// Creates a map[string]struct{} containing the slice values as keys
+func sliceToSet(s []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(s))
 	for _, v := range s {
-		m[v] = true
+		m[v] = struct{}{}
 	}
 	return m
 }
 
-func setToSlice(m map[string]bool) []string {
+func setToSlice(m map[string]struct{}) []string {
 	var result []string
 	for k := range m {
 		result = append(result, k)
@@ -2298,8 +2344,8 @@ func getNamespaceAnnotations(cache clustercache.ClusterCache, clusterID string) 
 	return nsToAnnotations, nil
 }
 
-func getDaemonsetsOfPod(pod v1.Pod) []string {
-	for _, ownerReference := range pod.ObjectMeta.OwnerReferences {
+func getDaemonsetsOfPod(pod clustercache.Pod) []string {
+	for _, ownerReference := range pod.OwnerReferences {
 		if ownerReference.Kind == "DaemonSet" {
 			return []string{ownerReference.Name}
 		}
@@ -2307,8 +2353,8 @@ func getDaemonsetsOfPod(pod v1.Pod) []string {
 	return []string{}
 }
 
-func getJobsOfPod(pod v1.Pod) []string {
-	for _, ownerReference := range pod.ObjectMeta.OwnerReferences {
+func getJobsOfPod(pod clustercache.Pod) []string {
+	for _, ownerReference := range pod.OwnerReferences {
 		if ownerReference.Kind == "Job" {
 			return []string{ownerReference.Name}
 		}
@@ -2316,8 +2362,8 @@ func getJobsOfPod(pod v1.Pod) []string {
 	return []string{}
 }
 
-func getStatefulSetsOfPod(pod v1.Pod) []string {
-	for _, ownerReference := range pod.ObjectMeta.OwnerReferences {
+func getStatefulSetsOfPod(pod clustercache.Pod) []string {
+	for _, ownerReference := range pod.OwnerReferences {
 		if ownerReference.Kind == "StatefulSet" {
 			return []string{ownerReference.Name}
 		}
@@ -2328,7 +2374,7 @@ func getStatefulSetsOfPod(pod v1.Pod) []string {
 // getGPUCount reads the node's Status and Labels (via the k8s API) to identify
 // the number of GPUs and vGPUs are equipped on the node. If unable to identify
 // a GPU count, it will return -1.
-func getGPUCount(cache clustercache.ClusterCache, n *v1.Node) (float64, float64, error) {
+func getGPUCount(cache clustercache.ClusterCache, n *clustercache.Node) (float64, float64, error) {
 	g, hasGpu := n.Status.Capacity["nvidia.com/gpu"]
 	_, hasReplicas := n.Labels["nvidia.com/gpu.replicas"]
 
@@ -2391,7 +2437,7 @@ func getAllocatableVGPUs(cache clustercache.ClusterCache) (float64, error) {
 	daemonsets := cache.GetAllDaemonSets()
 	vgpuCount := 0.0
 	for _, ds := range daemonsets {
-		dsContainerList := &ds.Spec.Template.Spec.Containers
+		dsContainerList := &ds.SpecContainers
 		for _, ctnr := range *dsContainerList {
 			if ctnr.Args != nil {
 				for _, arg := range ctnr.Args {

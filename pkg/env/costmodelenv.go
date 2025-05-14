@@ -71,7 +71,8 @@ const (
 	MultiClusterBasicAuthPassword = "MC_BASIC_AUTH_PW"
 	MultiClusterBearerToken       = "MC_BEARER_TOKEN"
 
-	InsecureSkipVerify = "INSECURE_SKIP_VERIFY"
+	InsecureSkipVerify   = "INSECURE_SKIP_VERIFY"
+	KubeRbacProxyEnabled = "KUBE_RBAC_PROXY_ENABLED"
 
 	KubeConfigPathEnvVar = "KUBECONFIG_PATH"
 
@@ -105,8 +106,7 @@ const (
 
 	ETLReadOnlyMode = "ETL_READ_ONLY"
 
-	AllocationNodeLabelsEnabled     = "ALLOCATION_NODE_LABELS_ENABLED"
-	AllocationNodeLabelsIncludeList = "ALLOCATION_NODE_LABELS_INCLUDE_LIST"
+	AllocationNodeLabelsEnabled = "ALLOCATION_NODE_LABELS_ENABLED"
 
 	AssetIncludeLocalDiskCostEnvVar = "ASSET_INCLUDE_LOCAL_DISK_COST"
 
@@ -139,6 +139,8 @@ const (
 	OCIPricingURL = "OCI_PRICING_URL"
 
 	CarbonEstimatesEnabledEnvVar = "CARBON_ESTIMATES_ENABLED"
+
+	UseCacheV1 = "USE_CACHE_V1"
 )
 
 const DefaultConfigMountPath = "/var/configs"
@@ -382,6 +384,10 @@ func GetInsecureSkipVerify() bool {
 	return env.GetBool(InsecureSkipVerify, false)
 }
 
+func IsKubeRbacProxyEnabled() bool {
+	return env.GetBool(KubeRbacProxyEnabled, false)
+}
+
 // IsAggregateCostModelCacheDisabled returns the environment variable value for DisableAggregateCostModelCache which
 // will inform the aggregator on whether to load cached data. Defaults to false
 func IsAggregateCostModelCacheDisabled() bool {
@@ -617,31 +623,6 @@ func GetAllocationNodeLabelsEnabled() bool {
 	return env.GetBool(AllocationNodeLabelsEnabled, true)
 }
 
-var defaultAllocationNodeLabelsIncludeList []string = []string{
-	"cloud.google.com/gke-nodepool",
-	"eks.amazonaws.com/nodegroup",
-	"kubernetes.azure.com/agentpool",
-	"node.kubernetes.io/instance-type",
-	"topology.kubernetes.io/region",
-	"topology.kubernetes.io/zone",
-}
-
-func GetAllocationNodeLabelsIncludeList() []string {
-	// If node labels are not enabled, return an empty list.
-	if !GetAllocationNodeLabelsEnabled() {
-		return []string{}
-	}
-
-	list := env.GetList(AllocationNodeLabelsIncludeList, ",")
-
-	// If node labels are enabled, but the white list is empty, use defaults.
-	if len(list) == 0 {
-		return defaultAllocationNodeLabelsIncludeList
-	}
-
-	return list
-}
-
 func GetAssetIncludeLocalDiskCost() bool {
 	return env.GetBool(AssetIncludeLocalDiskCostEnvVar, true)
 }
@@ -722,4 +703,10 @@ func GetCustomCostRefreshRateHours() string {
 
 func IsCarbonEstimatesEnabled() bool {
 	return env.GetBool(CarbonEstimatesEnabledEnvVar, false)
+}
+
+// GetUseCacheV1 is a temporary flag to allow users to opt-in to using the old cache
+// Mainly for comparison purposes
+func GetUseCacheV1() bool {
+	return env.GetBool(UseCacheV1, false)
 }

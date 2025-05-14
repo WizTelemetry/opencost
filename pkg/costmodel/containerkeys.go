@@ -2,11 +2,12 @@ package costmodel
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 
 	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/pkg/clustercache"
 	"github.com/opencost/opencost/pkg/env"
-	v1 "k8s.io/api/core/v1"
 )
 
 var (
@@ -135,9 +136,9 @@ func NewContainerMetricFromValues(ns, podName, containerName, nodeName, clusterI
 
 // NewContainerMetricsFromPod creates a slice of ContainerMetric instances for each container in the
 // provided Pod.
-func NewContainerMetricsFromPod(pod *v1.Pod, clusterID string) ([]*ContainerMetric, error) {
-	podName := pod.GetObjectMeta().GetName()
-	ns := pod.GetObjectMeta().GetNamespace()
+func NewContainerMetricsFromPod(pod *clustercache.Pod, clusterID string) ([]*ContainerMetric, error) {
+	podName := pod.Name
+	ns := pod.Namespace
 	node := pod.Spec.NodeName
 
 	var cs []*ContainerMetric
@@ -184,6 +185,7 @@ func NewContainerMetricFromPrometheus(metrics map[string]interface{}, defaultClu
 		return nil, NoNamespaceNameErr
 	}
 	node, ok := metrics["node"]
+
 	if !ok {
 		log.Debugf("Prometheus vector does not have node name")
 		node = ""
@@ -191,6 +193,13 @@ func NewContainerMetricFromPrometheus(metrics map[string]interface{}, defaultClu
 	nodeName, ok := node.(string)
 	if !ok {
 		return nil, NoNodeNameErr
+	} else {
+		// sometimes the port is in the node name, we need to remove that
+		// Check if the node name contains a port (format: <anything>:<integer>)
+		if matched, _ := regexp.MatchString(`^.*:\d+$`, nodeName); matched {
+			// Only split if the format matches <anything>:<integer>
+			nodeName = strings.Split(nodeName, ":")[0]
+		}
 	}
 	cid, ok := metrics[env.GetPromClusterLabel()]
 	if !ok {

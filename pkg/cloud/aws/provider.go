@@ -43,8 +43,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/jszwec/csvutil"
-
-	v1 "k8s.io/api/core/v1"
 )
 
 const (
@@ -156,6 +154,7 @@ var awsRegions = []string{
 	"af-south-1",
 	"us-gov-east-1",
 	"us-gov-west-1",
+	"me-central-1",
 }
 
 // AWS represents an Amazon Provider
@@ -249,6 +248,7 @@ type AWSProduct struct {
 type AWSProductAttributes struct {
 	Location        string `json:"location"`
 	RegionCode      string `json:"regionCode"`
+	Operation       string `json:"operation"`
 	InstanceType    string `json:"instanceType"`
 	Memory          string `json:"memory"`
 	Storage         string `json:"storage"`
@@ -301,14 +301,15 @@ type AWSCurrencyCode struct {
 
 // AWSProductTerms represents the full terms of the product
 type AWSProductTerms struct {
-	Sku      string        `json:"sku"`
-	OnDemand *AWSOfferTerm `json:"OnDemand"`
-	Reserved *AWSOfferTerm `json:"Reserved"`
-	Memory   string        `json:"memory"`
-	Storage  string        `json:"storage"`
-	VCpu     string        `json:"vcpu"`
-	GPU      string        `json:"gpu"` // GPU represents the number of GPU on the instance
-	PV       *models.PV    `json:"pv"`
+	Sku          string               `json:"sku"`
+	OnDemand     *AWSOfferTerm        `json:"OnDemand"`
+	Reserved     *AWSOfferTerm        `json:"Reserved"`
+	Memory       string               `json:"memory"`
+	Storage      string               `json:"storage"`
+	VCpu         string               `json:"vcpu"`
+	GPU          string               `json:"gpu"` // GPU represents the number of GPU on the instance
+	PV           *models.PV           `json:"pv"`
+	LoadBalancer *models.LoadBalancer `json:"load_balancer"`
 }
 
 // ClusterIdEnvVar is the environment variable in which one can manually set the ClusterId
@@ -340,12 +341,14 @@ var volTypes = map[string]string{
 	"EBS:VolumeP-IOPS.piops": "io1",
 	"EBS:VolumeUsage.st1":    "st1",
 	"EBS:VolumeUsage.piops":  "io1",
+	"EBS:VolumeUsage.io2":    "io2",
 	"gp2":                    "EBS:VolumeUsage.gp2",
 	"gp3":                    "EBS:VolumeUsage.gp3",
 	"standard":               "EBS:VolumeUsage",
 	"sc1":                    "EBS:VolumeUsage.sc1",
 	"io1":                    "EBS:VolumeUsage.piops",
 	"st1":                    "EBS:VolumeUsage.st1",
+	"io2":                    "EBS:VolumeUsage.io2",
 }
 
 var loadedAWSSecret bool = false
@@ -658,6 +661,10 @@ func (k *awsKey) getUsageType(labels map[string]string) string {
 	return ""
 }
 
+func (awsProvider *AWS) GpuPricing(nodeLabels map[string]string) (string, error) {
+	return "", nil
+}
+
 func (aws *AWS) PVPricing(pvk models.PVKey) (*models.PV, error) {
 	pricing, ok := aws.Pricing[pvk.Features()]
 	if !ok {
@@ -676,7 +683,7 @@ type awsPVKey struct {
 	ProviderID             string
 }
 
-func (aws *AWS) GetPVKey(pv *v1.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
+func (aws *AWS) GetPVKey(pv *clustercache.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
 	providerID := ""
 	if pv.Spec.AWSElasticBlockStore != nil {
 		providerID = pv.Spec.AWSElasticBlockStore.VolumeID
@@ -742,7 +749,7 @@ func getStorageClassTypeFrom(provisioner string) string {
 }
 
 // GetKey maps node labels to information needed to retrieve pricing data
-func (aws *AWS) GetKey(labels map[string]string, n *v1.Node) models.Key {
+func (aws *AWS) GetKey(labels map[string]string, n *clustercache.Node) models.Key {
 	return &awsKey{
 		SpotLabelName:  aws.SpotLabelName,
 		SpotLabelValue: aws.SpotLabelValue,
@@ -764,13 +771,13 @@ func (aws *AWS) ClusterManagementPricing() (string, float64, error) {
 }
 
 // Use the pricing data from the current region. Fall back to using all region data if needed.
-func (aws *AWS) getRegionPricing(nodeList []*v1.Node) (*http.Response, string, error) {
+func (aws *AWS) getRegionPricing(nodeList []*clustercache.Node) (*http.Response, string, error) {
 
 	pricingURL := "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/"
 	region := ""
 	multiregion := false
 	for _, n := range nodeList {
-		labels := n.GetLabels()
+		labels := n.Labels
 		currentNodeRegion := ""
 		if r, ok := util.GetRegion(labels); ok {
 			currentNodeRegion = r
@@ -854,7 +861,7 @@ func (aws *AWS) DownloadPricingData() error {
 			aws.clusterProvisioner = "KOPS"
 		}
 
-		labels := n.GetObjectMeta().GetLabels()
+		labels := n.Labels
 		key := aws.GetKey(labels, n)
 		inputkeys[key.Features()] = true
 	}
@@ -868,8 +875,8 @@ func (aws *AWS) DownloadPricingData() error {
 		if params != nil {
 			params["provisioner"] = storageClass.Provisioner
 		}
-		storageClassMap[storageClass.ObjectMeta.Name] = params
-		if storageClass.GetAnnotations()["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.GetAnnotations()["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
+		storageClassMap[storageClass.Name] = params
+		if storageClass.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
 			storageClassMap["default"] = params
 			storageClassMap[""] = params
 		}
@@ -1038,6 +1045,19 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 					skusToKeys[product.Sku] = key
 					aws.ValidPricingKeys[key] = true
 					aws.ValidPricingKeys[spotKey] = true
+				} else if strings.Contains(product.Attributes.UsageType, "LoadBalancerUsage") && product.Attributes.Operation == "LoadBalancing:Network" {
+					// since the costmodel is only using services of type LoadBalancer
+					// (and not ingresses controlled by AWS load balancer controller)
+					// we can safely filter for Network load balancers only
+					productTerms := &AWSProductTerms{
+						Sku:          product.Sku,
+						LoadBalancer: &models.LoadBalancer{},
+					}
+					// there is no spot pricing for load balancers
+					key := product.Attributes.RegionCode + ",LoadBalancerUsage"
+					aws.Pricing[key] = productTerms
+					skusToKeys[product.Sku] = key
+					aws.ValidPricingKeys[key] = true
 				}
 			}
 		}
@@ -1079,7 +1099,9 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 					spotKey := key + ",preemptible"
 					if ok {
 						aws.Pricing[key].OnDemand = offerTerm
-						aws.Pricing[spotKey].OnDemand = offerTerm
+						if _, ok := aws.Pricing[spotKey]; ok {
+							aws.Pricing[spotKey].OnDemand = offerTerm
+						}
 						var cost string
 						if _, isMatch := OnDemandRateCodes[offerTerm.OfferTermCode]; isMatch {
 							priceDimensionKey := strings.Join([]string{sku.(string), offerTerm.OfferTermCode, HourlyRateCode}, ".")
@@ -1134,6 +1156,13 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 							hourlyPrice := costFloat / 730
 
 							aws.Pricing[key].PV.Cost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
+						} else if strings.Contains(key, "LoadBalancerUsage") {
+							costFloat, err := strconv.ParseFloat(cost, 64)
+							if err != nil {
+								return err
+							}
+
+							aws.Pricing[key].LoadBalancer.Cost = costFloat
 						}
 					}
 
@@ -1204,21 +1233,20 @@ func (aws *AWS) NetworkPricing() (*models.Network, error) {
 }
 
 func (aws *AWS) LoadBalancerPricing() (*models.LoadBalancer, error) {
-	fffrc := 0.025
-	afrc := 0.010
-	lbidc := 0.008
+	// TODO: determine key based on function arguments
+	// this is something that should be changed in the Provider interface
 
-	numForwardingRules := 1.0
-	dataIngressGB := 0.0
+	key := aws.ClusterRegion + ",LoadBalancerUsage"
 
-	var totalCost float64
-	if numForwardingRules < 5 {
-		totalCost = fffrc*numForwardingRules + lbidc*dataIngressGB
-	} else {
-		totalCost = fffrc*5 + afrc*(numForwardingRules-5) + lbidc*dataIngressGB
+	// set default price
+	hourlyCost := 0.025
+	// use price index when available
+	if terms, ok := aws.Pricing[key]; ok {
+		hourlyCost = terms.LoadBalancer.Cost
 	}
+
 	return &models.LoadBalancer{
-		Cost: totalCost,
+		Cost: hourlyCost,
 	}, nil
 }
 
@@ -1439,13 +1467,12 @@ func (awsProvider *AWS) ClusterInfo() (map[string]string, error) {
 			clusterName = awsClusterID
 			log.Warnf("Warning - %s will be deprecated in a future release. Use %s instead", ocenv.AWSClusterIDEnvVar, ocenv.ClusterIDEnvVar)
 		} else if clusterName = ocenv.GetClusterID(); clusterName != "" {
-			log.Infof("Setting cluster name to %s from %s ", clusterName, ocenv.ClusterIDEnvVar)
+			log.DedupedInfof(5, "Setting cluster name to %s from %s ", clusterName, ocenv.ClusterIDEnvVar)
 		} else {
 			clusterName = defaultClusterName
-			log.Warnf("Unable to detect cluster name - using default of %s", defaultClusterName)
-			log.Warnf("Please set cluster name through configmap or via %s env var", ocenv.ClusterIDEnvVar)
+			log.DedupedWarningf(5, "Unable to detect cluster name - using default of %s", defaultClusterName)
+			log.DedupedWarningf(5, "Please set cluster name through configmap or via %s env var", ocenv.ClusterIDEnvVar)
 		}
-
 	}
 
 	// this value requires configuration but is unavailable else where

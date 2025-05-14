@@ -22,8 +22,6 @@ package opencost
 
 // Default Version Set (uses -version flag passed) includes shared resources
 // @bingen:generate:Window
-// @bingen:generate:Coverage
-// @bingen:generate:CoverageSet
 
 // Asset Version Set: Includes Asset pipeline specific resources
 // @bingen:set[name=Assets,version=21]
@@ -46,8 +44,8 @@ package opencost
 // @bingen:end
 
 // Allocation Version Set: Includes Allocation pipeline specific resources
-// @bingen:set[name=Allocation,version=22]
-// @bingen:generate:Allocation
+// @bingen:set[name=Allocation,version=23]
+// @bingen:generate[migrate]:Allocation
 // @bingen:generate[stringtable]:AllocationSet
 // @bingen:generate:AllocationSetRange
 // @bingen:generate:AllocationProperties
@@ -60,6 +58,7 @@ package opencost
 // @bingen:generate:PVAllocation
 // @bingen:generate:LbAllocations
 // @bingen:generate:LbAllocation
+// @bingen:generate:GPUAllocation
 // @bingen:end
 
 // @bingen:set[name=CloudCost,version=3]
@@ -71,4 +70,13 @@ package opencost
 // @bingen:generate:CloudCostLabels
 // @bingen:end
 
-//go:generate bingen -package=opencost -version=17 -buffer=github.com/opencost/opencost/core/pkg/util
+// @bingen:set[name=NetworkInsight,version=1]
+// @bingen:generate:NetworkInsightSet
+// @bingen:generate:NetworkInsight
+// @bingen:generate:NetworkTrafficDirection
+// @bingen:generate:NetworkTrafficType
+// @bingen:generate:NetworkDetail
+// @bingen:generate:NetworkDetailsSet
+// @bingen:end
+
+//go:generate bingen -package=opencost -version=18 -buffer=github.com/opencost/opencost/core/pkg/util
