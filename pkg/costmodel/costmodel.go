@@ -14,6 +14,7 @@ import (
 	"github.com/opencost/opencost/core/pkg/clusters"
 	coreenv "github.com/opencost/opencost/core/pkg/env"
 	"github.com/opencost/opencost/core/pkg/filter/allocation"
+	"github.com/opencost/opencost/core/pkg/filter/ast"
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/model/kubemodel"
 	"github.com/opencost/opencost/core/pkg/opencost"
@@ -22,10 +23,12 @@ import (
 	"github.com/opencost/opencost/core/pkg/util/promutil"
 	costAnalyzerCloud "github.com/opencost/opencost/pkg/cloud/models"
 	km "github.com/opencost/opencost/pkg/kubemodel"
+	"github.com/patrickmn/go-cache"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -39,6 +42,8 @@ const (
 	annotationStorageCost = annotationDomain + "/storage-hourly-cost"
 	annotationNodeCPUCost = annotationDomain + "/node-cpu-hourly-cost"
 	annotationNodeRAMCost = annotationDomain + "/node-ram-hourly-cost"
+
+	defaultAllocStepCacheTTL = 5 * time.Minute
 )
 
 // isCron matches a CronJob name and captures the non-timestamp name
@@ -57,6 +62,7 @@ type CostModel struct {
 	Provider        costAnalyzerCloud.Provider
 	KubeModel       *km.KubeModel
 	pricingMetadata *costAnalyzerCloud.PricingMatchMetadata
+	allocStepCache  *cache.Cache
 }
 
 func NewCostModel(
@@ -81,14 +87,19 @@ func NewCostModel(
 	}
 
 	return &CostModel{
-		Cache:         cache,
-		ClusterMap:    clusterMap,
-		BatchDuration: batchDuration,
-		DataSource:    dataSource,
-		Provider:      provider,
-		RequestGroup:  requestGroup,
-		KubeModel:     kubeModel,
+		Cache:          cache,
+		ClusterMap:     clusterMap,
+		BatchDuration:  batchDuration,
+		DataSource:     dataSource,
+		Provider:       provider,
+		RequestGroup:   requestGroup,
+		KubeModel:      kubeModel,
+		allocStepCache: newAllocStepCache(),
 	}
+}
+
+func newAllocStepCache() *cache.Cache {
+	return cache.New(defaultAllocStepCacheTTL, 2*defaultAllocStepCacheTTL)
 }
 
 func (cm *CostModel) ComputeKubeModelSet(start, end time.Time) (*kubemodel.KubeModelSet, error) {
@@ -1671,21 +1682,64 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 		return nil, fmt.Errorf("invalid accumulation configuration: %w", err)
 	}
 
+	var filterNode ast.FilterNode
+	var pushdown *allocationQueryPushdown
+	if filterString != "" {
+		parser := allocation.NewAllocationFilterParser()
+		filterNode, err = parser.Parse(filterString)
+		if err != nil {
+			return nil, fmt.Errorf("bad request - invalid filter: %w", err)
+		}
+		pushdown = allocationPushdownFromFilter(filterNode)
+	}
+
+	// Pushdown filtering at the PromQL level changes the underlying data scope,
+	// which skews shared cost distribution and CPU/RAM request/usage metrics.
+	// Disabling pushdown ensures data consistency: the filter is still applied
+	// correctly as a post-filter during AggregateBy (same as the summary path).
+	//
+	// The pushdown extraction above is intentionally kept (not removed) to
+	// preserve the filter AST parsing and validation logic. pushdown is
+	// discarded via _ and queryPushdown is forced to nil. If pushdown is
+	// re-enabled in the future, ensure:
+	//   1. All PromQL queries consistently use allocationClusterFilter /
+	//      allocationNamespaceFilter (PV queries currently use bare cfg.ClusterFilter)
+	//   2. ComputeAssets supports the same pushdown scope for idle correctness
+	//   3. Shared cost distribution is normalized to the full-cluster baseline
+	_ = pushdown
+	queryPushdown := (*allocationQueryPushdown)(nil)
+
 	// Query for AllocationSets in increments of the given step duration,
 	// appending each to the response.
 	stepStart := *queryWindow.Start()
 	stepEnd := stepStart.Add(step)
 	var isAKS bool
 	for queryWindow.End().After(stepStart) {
-		allocSet, err := cm.ComputeAllocation(stepStart, stepEnd)
-		if err != nil {
-			return nil, fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
-		}
+		var allocSet *opencost.AllocationSet
 
 		if includeIdle {
-			assetSet, err := cm.ComputeAssets(stepStart, stepEnd)
-			if err != nil {
-				return nil, fmt.Errorf("error computing assets for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+			var g errgroup.Group
+			var assetSet *opencost.AssetSet
+
+			g.Go(func() error {
+				var err error
+				allocSet, err = cm.computeAllocationWithPushdown(stepStart, stepEnd, queryPushdown)
+				if err != nil {
+					return fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+				}
+				return nil
+			})
+			g.Go(func() error {
+				var err error
+				assetSet, err = cm.ComputeAssets(stepStart, stepEnd)
+				if err != nil {
+					return fmt.Errorf("error computing assets for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+				}
+				return nil
+			})
+
+			if err := g.Wait(); err != nil {
+				return nil, err
 			}
 
 			if includeProportionalAssetResourceCosts {
@@ -1715,39 +1769,18 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 			for _, idleAlloc := range idleSet.Allocations {
 				allocSet.Insert(idleAlloc)
 			}
+		} else {
+			var err error
+			allocSet, err = cm.computeAllocationWithPushdown(stepStart, stepEnd, queryPushdown)
+			if err != nil {
+				return nil, fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+			}
 		}
 
 		asr.Append(allocSet)
 
 		stepStart = stepEnd
 		stepEnd = stepStart.Add(step)
-	}
-
-	// Apply allocation filter BEFORE aggregation if provided
-	if filterString != "" {
-		parser := allocation.NewAllocationFilterParser()
-		filterNode, err := parser.Parse(filterString)
-		if err != nil {
-			return nil, fmt.Errorf("invalid filter: %w", err)
-		}
-		compiler := opencost.NewAllocationMatchCompiler(nil)
-		matcher, err := compiler.Compile(filterNode)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile filter: %w", err)
-		}
-		filteredASR := opencost.NewAllocationSetRange()
-		for _, as := range asr.Allocations {
-			filteredAS := opencost.NewAllocationSet(as.Start(), as.End())
-			for _, alloc := range as.Allocations {
-				if matcher.Matches(alloc) {
-					filteredAS.Set(alloc)
-				}
-			}
-			if filteredAS.Length() > 0 {
-				filteredASR.Append(filteredAS)
-			}
-		}
-		asr = filteredASR
 	}
 
 	// Set aggregation options and aggregate
@@ -1763,6 +1796,7 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 		IdleByNode:                            idleByNode,
 		IncludeAggregatedMetadata:             includeAggregatedMetadata,
 		ShareIdle:                             shareIdleOpt,
+		Filter:                                filterNode,
 	}
 
 	// Aggregate

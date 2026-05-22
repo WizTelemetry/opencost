@@ -20,9 +20,10 @@ const PrometheusMetricsQueryLogFormat = `[PrometheusMetricsQuerier][%s][At Time:
 
 // PrometheusMetricsQuerier is the implementation of the data source's MetricsQuerier interface for Prometheus.
 type PrometheusMetricsQuerier struct {
-	promConfig   *OpenCostPrometheusConfig
-	promClient   prometheus.Client
-	promContexts *ContextFactory
+	promConfig       *OpenCostPrometheusConfig
+	promClient       prometheus.Client
+	promContexts     *ContextFactory
+	allocationFilter allocationQueryFilter
 }
 
 func newPrometheusMetricsQuerier(
@@ -103,7 +104,7 @@ func (pds *PrometheusMetricsQuerier) QueryPVCInfo(start, end time.Time) *source.
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPVCInfo := fmt.Sprintf(queryFmtPVCInfo, cfg.ClusterFilter, cfg.ClusterLabel, durStr, minsPerResolution)
+	queryPVCInfo := fmt.Sprintf(queryFmtPVCInfo, pds.allocationNamespaceFilter(), cfg.ClusterLabel, durStr, minsPerResolution)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPVCInfo)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -122,7 +123,7 @@ func (pds *PrometheusMetricsQuerier) QueryPVActiveMinutes(start, end time.Time) 
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPVActiveMins := fmt.Sprintf(pvActiveMinsQuery, cfg.ClusterFilter, cfg.ClusterLabel, durStr, minsPerResolution)
+	queryPVActiveMins := fmt.Sprintf(pvActiveMinsQuery, pds.allocationClusterFilter(), cfg.ClusterLabel, durStr, minsPerResolution)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPVActiveMins)
 
 	ctx := pds.promContexts.NewNamedContext(ClusterContextName)
@@ -140,7 +141,7 @@ func (pds *PrometheusMetricsQuerier) QueryLocalStorageUsedAvg(start, end time.Ti
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryLocalStorageUsedAvg := fmt.Sprintf(localStorageUsedAvgQuery, cfg.ClusterFilter, durStr, cfg.ClusterLabel, cfg.ClusterLabel)
+	queryLocalStorageUsedAvg := fmt.Sprintf(localStorageUsedAvgQuery, pds.allocationClusterFilter(), durStr, cfg.ClusterLabel, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryLocalStorageUsedAvg)
 
 	ctx := pds.promContexts.NewNamedContext(ClusterContextName)
@@ -158,7 +159,7 @@ func (pds *PrometheusMetricsQuerier) QueryLocalStorageUsedMax(start, end time.Ti
 		panic("failed to parse duration string passed to QueryLocalStorageUsedMax")
 	}
 
-	queryLocalStorageUsedMax := fmt.Sprintf(localStorageUsedMaxQuery, cfg.ClusterFilter, durStr, cfg.ClusterLabel, cfg.ClusterLabel)
+	queryLocalStorageUsedMax := fmt.Sprintf(localStorageUsedMaxQuery, pds.allocationClusterFilter(), durStr, cfg.ClusterLabel, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryLocalStorageUsedMax)
 
 	ctx := pds.promContexts.NewNamedContext(ClusterContextName)
@@ -496,7 +497,7 @@ func (pds *PrometheusMetricsQuerier) QueryPods(start, end time.Time) *source.Fut
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPods := fmt.Sprintf(queryFmtPods, cfg.ClusterFilter, cfg.ClusterLabel, durStr, minsPerResolution)
+	queryPods := fmt.Sprintf(queryFmtPods, pds.allocationNamespaceFilter(), cfg.ClusterLabel, durStr, minsPerResolution)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPods)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -515,7 +516,7 @@ func (pds *PrometheusMetricsQuerier) QueryPodsUID(start, end time.Time) *source.
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPodsUID := fmt.Sprintf(queryFmtPodsUID, cfg.ClusterFilter, cfg.ClusterLabel, durStr, minsPerResolution)
+	queryPodsUID := fmt.Sprintf(queryFmtPodsUID, pds.allocationNamespaceFilter(), cfg.ClusterLabel, durStr, minsPerResolution)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPodsUID)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -533,7 +534,7 @@ func (pds *PrometheusMetricsQuerier) QueryRAMBytesAllocated(start, end time.Time
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryRAMBytesAllocated := fmt.Sprintf(queryFmtRAMBytesAllocated, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryRAMBytesAllocated := fmt.Sprintf(queryFmtRAMBytesAllocated, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryRAMBytesAllocated)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -551,7 +552,7 @@ func (pds *PrometheusMetricsQuerier) QueryRAMRequests(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryRAMRequests := fmt.Sprintf(queryFmtRAMRequests, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryRAMRequests := fmt.Sprintf(queryFmtRAMRequests, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryRAMRequests)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -569,7 +570,7 @@ func (pds *PrometheusMetricsQuerier) QueryRAMLimits(start, end time.Time) *sourc
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryRAMLimits := fmt.Sprintf(queryFmtRAMLimits, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryRAMLimits := fmt.Sprintf(queryFmtRAMLimits, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryRAMLimits)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -587,7 +588,7 @@ func (pds *PrometheusMetricsQuerier) QueryRAMUsageAvg(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryRAMUsageAvg := fmt.Sprintf(queryFmtRAMUsageAvg, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryRAMUsageAvg := fmt.Sprintf(queryFmtRAMUsageAvg, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryRAMUsageAvg)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -605,7 +606,7 @@ func (pds *PrometheusMetricsQuerier) QueryRAMUsageMax(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryRAMUsageMax := fmt.Sprintf(queryFmtRAMUsageMax, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryRAMUsageMax := fmt.Sprintf(queryFmtRAMUsageMax, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryRAMUsageMax)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -623,7 +624,7 @@ func (pds *PrometheusMetricsQuerier) QueryCPUCoresAllocated(start, end time.Time
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryCPUCoresAllocated := fmt.Sprintf(queryFmtCPUCoresAllocated, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryCPUCoresAllocated := fmt.Sprintf(queryFmtCPUCoresAllocated, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryCPUCoresAllocated)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -641,7 +642,7 @@ func (pds *PrometheusMetricsQuerier) QueryCPURequests(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryCPURequests := fmt.Sprintf(queryFmtCPURequests, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryCPURequests := fmt.Sprintf(queryFmtCPURequests, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryCPURequests)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -659,7 +660,7 @@ func (pds *PrometheusMetricsQuerier) QueryCPULimits(start, end time.Time) *sourc
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryCPULimits := fmt.Sprintf(queryFmtCPULimits, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryCPULimits := fmt.Sprintf(queryFmtCPULimits, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryCPULimits)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -677,7 +678,7 @@ func (pds *PrometheusMetricsQuerier) QueryCPUUsageAvg(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryCPUUsageAvg := fmt.Sprintf(queryFmtCPUUsageAvg, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryCPUUsageAvg := fmt.Sprintf(queryFmtCPUUsageAvg, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryCPUUsageAvg)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -719,7 +720,7 @@ func (pds *PrometheusMetricsQuerier) QueryCPUUsageMax(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryCPUUsageMaxRecordingRule := fmt.Sprintf(queryFmtCPUUsageMaxRecordingRule, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryCPUUsageMaxRecordingRule := fmt.Sprintf(queryFmtCPUUsageMaxRecordingRule, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryCPUUsageMaxRecordingRule)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -737,7 +738,7 @@ func (pds *PrometheusMetricsQuerier) QueryCPUUsageMax(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryCPUUsageMaxSubquery := fmt.Sprintf(queryFmtCPUUsageMaxSubquery, cfg.ClusterFilter, 2*minsPerResolution, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryCPUUsageMaxSubquery := fmt.Sprintf(queryFmtCPUUsageMaxSubquery, pds.allocationNamespaceFilter(), 2*minsPerResolution, durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryCPUUsageMaxSubquery)
 
 	return source.NewFuture(source.DecodeCPUUsageMaxResult, ctx.QueryAtTime(queryCPUUsageMaxSubquery, end))
@@ -754,7 +755,7 @@ func (pds *PrometheusMetricsQuerier) QueryGPUsRequested(start, end time.Time) *s
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryGPUsRequested := fmt.Sprintf(queryFmtGPUsRequested, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryGPUsRequested := fmt.Sprintf(queryFmtGPUsRequested, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryGPUsRequested)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -808,7 +809,7 @@ func (pds *PrometheusMetricsQuerier) QueryGPUsAllocated(start, end time.Time) *s
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryGPUsAllocated := fmt.Sprintf(queryFmtGPUsAllocated, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryGPUsAllocated := fmt.Sprintf(queryFmtGPUsAllocated, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryGPUsAllocated)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -826,7 +827,7 @@ func (pds *PrometheusMetricsQuerier) QueryIsGPUShared(start, end time.Time) *sou
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryIsGPUShared := fmt.Sprintf(queryFmtIsGPUShared, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryIsGPUShared := fmt.Sprintf(queryFmtIsGPUShared, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryIsGPUShared)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -844,7 +845,7 @@ func (pds *PrometheusMetricsQuerier) QueryGPUInfo(start, end time.Time) *source.
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryGetGPUInfo := fmt.Sprintf(queryFmtGetGPUInfo, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryGetGPUInfo := fmt.Sprintf(queryFmtGetGPUInfo, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryGetGPUInfo)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -862,7 +863,7 @@ func (pds *PrometheusMetricsQuerier) QueryNodeCPUPricePerHr(start, end time.Time
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNodeCostPerCPUHr := fmt.Sprintf(queryFmtNodeCostPerCPUHr, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryNodeCostPerCPUHr := fmt.Sprintf(queryFmtNodeCostPerCPUHr, pds.allocationClusterFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNodeCostPerCPUHr)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -880,7 +881,7 @@ func (pds *PrometheusMetricsQuerier) QueryNodeRAMPricePerGiBHr(start, end time.T
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNodeCostPerRAMGiBHr := fmt.Sprintf(queryFmtNodeCostPerRAMGiBHr, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryNodeCostPerRAMGiBHr := fmt.Sprintf(queryFmtNodeCostPerRAMGiBHr, pds.allocationClusterFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNodeCostPerRAMGiBHr)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -898,7 +899,7 @@ func (pds *PrometheusMetricsQuerier) QueryNodeGPUPricePerHr(start, end time.Time
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNodeCostPerGPUHr := fmt.Sprintf(queryFmtNodeCostPerGPUHr, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryNodeCostPerGPUHr := fmt.Sprintf(queryFmtNodeCostPerGPUHr, pds.allocationClusterFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNodeCostPerGPUHr)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -909,14 +910,12 @@ func (pds *PrometheusMetricsQuerier) QueryNodeIsSpot(start, end time.Time) *sour
 	const queryName = "QueryNodeIsSpot"
 	const queryFmtNodeIsSpot = `avg_over_time(kubecost_node_is_spot{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNodeIsSpot := fmt.Sprintf(queryFmtNodeIsSpot, cfg.ClusterFilter, durStr)
+	queryNodeIsSpot := fmt.Sprintf(queryFmtNodeIsSpot, pds.allocationClusterFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNodeIsSpot)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -934,7 +933,7 @@ func (pds *PrometheusMetricsQuerier) QueryPodPVCAllocation(start, end time.Time)
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPodPVCAllocation := fmt.Sprintf(queryFmtPodPVCAllocation, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryPodPVCAllocation := fmt.Sprintf(queryFmtPodPVCAllocation, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPodPVCAllocation)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -952,7 +951,7 @@ func (pds *PrometheusMetricsQuerier) QueryPVCBytesRequested(start, end time.Time
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPVCBytesRequested := fmt.Sprintf(queryFmtPVCBytesRequested, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryPVCBytesRequested := fmt.Sprintf(queryFmtPVCBytesRequested, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPVCBytesRequested)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1007,7 +1006,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetZoneGiB(start, end time.Time) *sour
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetZoneGiB := fmt.Sprintf(queryFmtNetZoneGiB, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetZoneGiB := fmt.Sprintf(queryFmtNetZoneGiB, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetZoneGiB)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1044,7 +1043,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetRegionGiB(start, end time.Time) *so
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetRegionGiB := fmt.Sprintf(queryFmtNetRegionGiB, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetRegionGiB := fmt.Sprintf(queryFmtNetRegionGiB, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetRegionGiB)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1081,7 +1080,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetInternetGiB(start, end time.Time) *
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetInternetGiB := fmt.Sprintf(queryFmtNetInternetGiB, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetInternetGiB := fmt.Sprintf(queryFmtNetInternetGiB, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetInternetGiB)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1155,7 +1154,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetNatGatewayGiB(start, end time.Time)
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetNatGatewayGiB := fmt.Sprintf(queryFmtNetNatGatewayGiB, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetNatGatewayGiB := fmt.Sprintf(queryFmtNetNatGatewayGiB, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetNatGatewayGiB)
 
 	ctx := pds.promContexts.NewNamedContext(NetworkInsightsContextName)
@@ -1174,7 +1173,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetTransferBytes(start, end time.Time)
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetTransferBytes := fmt.Sprintf(queryFmtNetTransferBytes, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetTransferBytes := fmt.Sprintf(queryFmtNetTransferBytes, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetTransferBytes)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1287,7 +1286,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetNatGatewayIngressGiB(start, end tim
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetNatGatewayIngressGiB := fmt.Sprintf(queryFmtNetNatGatewayIngressGiB, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetNatGatewayIngressGiB := fmt.Sprintf(queryFmtNetNatGatewayIngressGiB, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetNatGatewayIngressGiB)
 
 	ctx := pds.promContexts.NewNamedContext(NetworkInsightsContextName)
@@ -1306,7 +1305,7 @@ func (pds *PrometheusMetricsQuerier) QueryNetReceiveBytes(start, end time.Time) 
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNetReceiveBytes := fmt.Sprintf(queryFmtNetReceiveBytes, cfg.ClusterFilter, durStr, minsPerResolution, cfg.ClusterLabel)
+	queryNetReceiveBytes := fmt.Sprintf(queryFmtNetReceiveBytes, pds.allocationNamespaceFilter(), durStr, minsPerResolution, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNetReceiveBytes)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1338,14 +1337,12 @@ func (pds *PrometheusMetricsQuerier) QueryNamespaceLabels(start, end time.Time) 
 	const queryName = "QueryNamespaceLabels"
 	const queryFmtNamespaceLabels = `avg_over_time(kube_namespace_labels{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNamespaceLabels := fmt.Sprintf(queryFmtNamespaceLabels, cfg.ClusterFilter, durStr)
+	queryNamespaceLabels := fmt.Sprintf(queryFmtNamespaceLabels, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNamespaceLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1356,14 +1353,12 @@ func (pds *PrometheusMetricsQuerier) QueryNamespaceAnnotations(start, end time.T
 	const queryName = "QueryNamespaceAnnotations"
 	const queryFmtNamespaceAnnotations = `avg_over_time(kube_namespace_annotations{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryNamespaceAnnotations := fmt.Sprintf(queryFmtNamespaceAnnotations, cfg.ClusterFilter, durStr)
+	queryNamespaceAnnotations := fmt.Sprintf(queryFmtNamespaceAnnotations, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryNamespaceAnnotations)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1374,14 +1369,12 @@ func (pds *PrometheusMetricsQuerier) QueryPodLabels(start, end time.Time) *sourc
 	const queryName = "QueryPodLabels"
 	const queryFmtPodLabels = `avg_over_time(kube_pod_labels{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPodLabels := fmt.Sprintf(queryFmtPodLabels, cfg.ClusterFilter, durStr)
+	queryPodLabels := fmt.Sprintf(queryFmtPodLabels, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPodLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1392,14 +1385,12 @@ func (pds *PrometheusMetricsQuerier) QueryPodAnnotations(start, end time.Time) *
 	const queryName = "QueryPodAnnotations"
 	const queryFmtPodAnnotations = `avg_over_time(kube_pod_annotations{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPodAnnotations := fmt.Sprintf(queryFmtPodAnnotations, cfg.ClusterFilter, durStr)
+	queryPodAnnotations := fmt.Sprintf(queryFmtPodAnnotations, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPodAnnotations)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1410,14 +1401,12 @@ func (pds *PrometheusMetricsQuerier) QueryServiceLabels(start, end time.Time) *s
 	const queryName = "QueryServiceLabels"
 	const queryFmtServiceLabels = `avg_over_time(service_selector_labels{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryServiceLabels := fmt.Sprintf(queryFmtServiceLabels, cfg.ClusterFilter, durStr)
+	queryServiceLabels := fmt.Sprintf(queryFmtServiceLabels, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryServiceLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1428,14 +1417,12 @@ func (pds *PrometheusMetricsQuerier) QueryDeploymentLabels(start, end time.Time)
 	const queryName = "QueryDeploymentLabels"
 	const queryFmtDeploymentLabels = `avg_over_time(deployment_match_labels{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryDeploymentLabels := fmt.Sprintf(queryFmtDeploymentLabels, cfg.ClusterFilter, durStr)
+	queryDeploymentLabels := fmt.Sprintf(queryFmtDeploymentLabels, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryDeploymentLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1446,14 +1433,12 @@ func (pds *PrometheusMetricsQuerier) QueryStatefulSetLabels(start, end time.Time
 	const queryName = "QueryStatefulSetLabels"
 	const queryFmtStatefulSetLabels = `avg_over_time(statefulSet_match_labels{%s}[%s])`
 
-	cfg := pds.promConfig
-
 	durStr := timeutil.DurationString(end.Sub(start))
 	if durStr == "" {
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryStatefulSetLabels := fmt.Sprintf(queryFmtStatefulSetLabels, cfg.ClusterFilter, durStr)
+	queryStatefulSetLabels := fmt.Sprintf(queryFmtStatefulSetLabels, pds.allocationNamespaceFilter(), durStr)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryStatefulSetLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1471,7 +1456,7 @@ func (pds *PrometheusMetricsQuerier) QueryDaemonSetLabels(start, end time.Time) 
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryDaemonSetLabels := fmt.Sprintf(queryFmtDaemonSetLabels, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryDaemonSetLabels := fmt.Sprintf(queryFmtDaemonSetLabels, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryDaemonSetLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1489,7 +1474,7 @@ func (pds *PrometheusMetricsQuerier) QueryJobLabels(start, end time.Time) *sourc
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryJobLabels := fmt.Sprintf(queryFmtJobLabels, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryJobLabels := fmt.Sprintf(queryFmtJobLabels, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryJobLabels)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1507,7 +1492,7 @@ func (pds *PrometheusMetricsQuerier) QueryPodsWithReplicaSetOwner(start, end tim
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryPodsWithReplicaSetOwner := fmt.Sprintf(queryFmtPodsWithReplicaSetOwner, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryPodsWithReplicaSetOwner := fmt.Sprintf(queryFmtPodsWithReplicaSetOwner, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryPodsWithReplicaSetOwner)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1525,7 +1510,7 @@ func (pds *PrometheusMetricsQuerier) QueryReplicaSetsWithoutOwners(start, end ti
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryReplicaSetsWithoutOwners := fmt.Sprintf(queryFmtReplicaSetsWithoutOwners, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryReplicaSetsWithoutOwners := fmt.Sprintf(queryFmtReplicaSetsWithoutOwners, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryReplicaSetsWithoutOwners)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)
@@ -1543,7 +1528,7 @@ func (pds *PrometheusMetricsQuerier) QueryReplicaSetsWithRollout(start, end time
 		panic(fmt.Sprintf("failed to parse duration string passed to %s", queryName))
 	}
 
-	queryReplicaSetsWithRolloutOwner := fmt.Sprintf(queryFmtReplicaSetsWithRolloutOwner, cfg.ClusterFilter, durStr, cfg.ClusterLabel)
+	queryReplicaSetsWithRolloutOwner := fmt.Sprintf(queryFmtReplicaSetsWithRolloutOwner, pds.allocationNamespaceFilter(), durStr, cfg.ClusterLabel)
 	log.Debugf(PrometheusMetricsQueryLogFormat, queryName, end.Unix(), queryReplicaSetsWithRolloutOwner)
 
 	ctx := pds.promContexts.NewNamedContext(AllocationContextName)

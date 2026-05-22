@@ -9,8 +9,79 @@ import (
 	"github.com/opencost/opencost/core/pkg/util/timeutil"
 
 	"github.com/opencost/opencost/core/pkg/log"
+	coreenv "github.com/opencost/opencost/core/pkg/env"
 	"github.com/opencost/opencost/pkg/env"
 )
+
+type allocStepCacheValue struct {
+	allocSet *opencost.AllocationSet
+	nodeMap  map[nodeKey]*nodePricing
+}
+
+const (
+	allocStepRealtimeTTLEnvVar    = "OPENCOST_ALLOCATION_STEP_CACHE_TTL_SECONDS"
+	allocStepHistoricalTTLEnvVar  = "OPENCOST_ALLOCATION_HISTORICAL_STEP_CACHE_TTL_SECONDS"
+	defaultAllocStepRealtimeTTL   = 30 * time.Second
+	defaultAllocStepHistoricalTTL = 10 * time.Minute
+)
+
+func allocStepRealtimeCacheTTL() time.Duration {
+	seconds := coreenv.GetInt(allocStepRealtimeTTLEnvVar, -1)
+	if seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultAllocStepRealtimeTTL
+}
+
+func allocStepHistoricalCacheTTL() time.Duration {
+	seconds := coreenv.GetInt(allocStepHistoricalTTLEnvVar, -1)
+	if seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultAllocStepHistoricalTTL
+}
+
+func allocStepCacheTTL(windowEnd time.Time) time.Duration {
+	now := time.Now()
+	if windowEnd.Add(1 * time.Hour).Before(now) {
+		return allocStepHistoricalCacheTTL()
+	}
+	return allocStepRealtimeCacheTTL()
+}
+
+func allocStepCacheKey(start, end time.Time, resolution time.Duration) string {
+	return allocStepCacheKeyWithPushdown(start, end, resolution, nil)
+}
+
+func allocStepCacheKeyWithPushdown(start, end time.Time, resolution time.Duration, pushdown *allocationQueryPushdown) string {
+	cluster := ""
+	namespace := ""
+	if pushdown != nil {
+		cluster = pushdown.cluster
+		namespace = pushdown.namespace
+	}
+
+	return fmt.Sprintf("%d-%d-%s-%v-%s-%s",
+		start.Unix(),
+		end.Unix(),
+		resolution.String(),
+		env.IsIngestingPodUID(),
+		cluster,
+		namespace,
+	)
+}
+
+func cloneNodeMap(src map[nodeKey]*nodePricing) map[nodeKey]*nodePricing {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[nodeKey]*nodePricing, len(src))
+	for k, v := range src {
+		copyVal := *v
+		dst[k] = &copyVal
+	}
+	return dst
+}
 
 // CanCompute should return true if CostModel can act as a valid source for the
 // given time range. In the case of CostModel we want to attempt to compute as
@@ -30,58 +101,44 @@ func (cm *CostModel) Name() string {
 // for the window defined by the given start and end times. The Allocations
 // returned are unaggregated (i.e. down to the container level).
 func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.AllocationSet, error) {
+	return cm.computeAllocationWithPushdown(start, end, nil)
+}
 
-	// If the duration is short enough, compute the AllocationSet directly
+// DateRange checks the data (up to 90 days in the past), and returns the oldest and newest sample timestamp from opencost scraping metric
+// it supposed to be a good indicator of available allocation data
+func (cm *CostModel) DateRange(limitDays int) (time.Time, time.Time, error) {
+	return cm.DataSource.Metrics().QueryDataCoverage(limitDays)
+}
+
+func (cm *CostModel) computeAllocationWithPushdown(start, end time.Time, pushdown *allocationQueryPushdown) (*opencost.AllocationSet, error) {
 	if end.Sub(start) <= cm.BatchDuration {
-		as, _, err := cm.computeAllocation(start, end)
+		as, _, err := cm.computeAllocationStep(start, end, pushdown)
 		return as, err
 	}
 
-	// If the duration exceeds the configured MaxPrometheusQueryDuration, then
-	// query for maximum-sized AllocationSets, collect them, and accumulate.
-
-	// s and e track the coverage of the entire given window over multiple
-	// internal queries.
 	s, e := start, start
-
-	// Collect AllocationSets in a range, then accumulate
-	// TODO optimize by collecting consecutive AllocationSets, accumulating as we go
 	asr := opencost.NewAllocationSetRange()
 
 	for e.Before(end) {
-		// By default, query for the full remaining duration. But do not let
-		// any individual query duration exceed the configured max Prometheus
-		// query duration.
 		duration := end.Sub(e)
 		if duration > cm.BatchDuration {
 			duration = cm.BatchDuration
 		}
 
-		// Set start and end parameters (s, e) for next individual computation.
 		e = s.Add(duration)
 
-		// Compute the individual AllocationSet for just (s, e)
-		as, _, err := cm.computeAllocation(s, e)
+		as, _, err := cm.computeAllocationStep(s, e, pushdown)
 		if err != nil {
 			return opencost.NewAllocationSet(start, end), fmt.Errorf("error computing allocation for %s: %s", opencost.NewClosedWindow(s, e), err)
 		}
 
-		// Append to the range
 		asr.Append(as)
-
-		// Set s equal to e to set up the next query, if one exists.
 		s = e
 	}
 
-	// Populate annotations, labels, and services on each Allocation. This is
-	// necessary because Properties.Intersection does not propagate any values
-	// stored in maps or slices for performance reasons. In this case, however,
-	// it is both acceptable and necessary to do so.
 	allocationAnnotations := map[string]map[string]string{}
 	allocationLabels := map[string]map[string]string{}
 	allocationServices := map[string]map[string]bool{}
-
-	// Also record errors and warnings, then append them to the results later.
 	errors := []string{}
 	warnings := []string{}
 
@@ -119,9 +176,6 @@ func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.Allocati
 		warnings = append(warnings, as.Warnings...)
 	}
 
-	// Accumulate to yield the result AllocationSet. After this step, we will
-	// be nearly complete, but without the raw allocation data, which must be
-	// recomputed.
 	resultASR, err := asr.Accumulate(opencost.AccumulateOptionAll)
 	if err != nil {
 		return opencost.NewAllocationSet(start, end), fmt.Errorf("error accumulating data for %s: %s", opencost.NewClosedWindow(s, e), err)
@@ -132,10 +186,8 @@ func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.Allocati
 	if length := len(resultASR.Allocations); length != 1 {
 		return opencost.NewAllocationSet(start, end), fmt.Errorf("expected 1 accumulated allocation set, found %d sets", length)
 	}
-	result := resultASR.Allocations[0]
 
-	// Apply the annotations, labels, and services to the post-accumulation
-	// results. (See above for why this is necessary.)
+	result := resultASR.Allocations[0]
 	for k, a := range result.Allocations {
 		if annotations, ok := allocationAnnotations[k]; ok {
 			a.Properties.Annotations = annotations
@@ -152,14 +204,9 @@ func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.Allocati
 			}
 		}
 
-		// Expand the Window of all Allocations within the AllocationSet
-		// to match the Window of the AllocationSet, which gets expanded
-		// at the end of this function.
 		a.Window = a.Window.ExpandStart(start).ExpandEnd(end)
 	}
 
-	// Maintain RAM and CPU max usage values by iterating over the range,
-	// computing maximums on a rolling basis, and setting on the result set.
 	for _, as := range asr.Allocations {
 		for key, alloc := range as.Allocations {
 			resultAlloc := result.Get(key)
@@ -172,8 +219,6 @@ func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.Allocati
 			}
 
 			if alloc.RawAllocationOnly == nil {
-				// This will happen inevitably for unmounted disks, but should
-				// ideally not happen for any allocation with CPU and RAM data.
 				if !alloc.IsUnmounted() {
 					log.DedupedWarningf(10, "ComputeAllocation: raw allocation data missing for %s", key)
 				}
@@ -193,34 +238,37 @@ func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.Allocati
 					resultAlloc.RawAllocationOnly.GPUUsageMax = alloc.RawAllocationOnly.GPUUsageMax
 				}
 			}
-
 		}
 	}
 
-	// Expand the window to match the queried time range.
 	result.Window = result.Window.ExpandStart(start).ExpandEnd(end)
-
-	// Append errors and warnings
 	result.Errors = errors
 	result.Warnings = warnings
-
-	// Convert any NaNs to 0 to avoid JSON marshaling issues and avoid cascading NaN appearances elsewhere
 	result.SanitizeNaN()
 
 	return result, nil
 }
 
-// DateRange checks the data (up to 90 days in the past), and returns the oldest and newest sample timestamp from opencost scraping metric
-// it supposed to be a good indicator of available allocation data
-func (cm *CostModel) DateRange(limitDays int) (time.Time, time.Time, error) {
-	return cm.DataSource.Metrics().QueryDataCoverage(limitDays)
+func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.AllocationSet, map[nodeKey]*nodePricing, error) {
+	return cm.computeAllocationStep(start, end, nil)
 }
 
-func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.AllocationSet, map[nodeKey]*nodePricing, error) {
+func (cm *CostModel) computeAllocationStep(start, end time.Time, pushdown *allocationQueryPushdown) (*opencost.AllocationSet, map[nodeKey]*nodePricing, error) {
 	// 1. Build out Pod map from resolution-tuned, batched Pod start/end query
 	// 2. Run and apply the results of the remaining queries to
 	// 3. Build out AllocationSet from completed Pod map
-	resolution := cm.DataSource.Resolution()
+	resolution := time.Duration(0)
+	if cm.DataSource != nil {
+		resolution = cm.DataSource.Resolution()
+	}
+
+	if cm.allocStepCache != nil {
+		key := allocStepCacheKeyWithPushdown(start, end, resolution, pushdown)
+		if val, found := cm.allocStepCache.Get(key); found {
+			cached := val.(*allocStepCacheValue)
+			return cached.allocSet.Clone(), cloneNodeMap(cached.nodeMap), nil
+		}
+	}
 
 	// Create a window spanning the requested query
 	window := opencost.NewWindow(&start, &end)
@@ -257,7 +305,7 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 		log.Debugf("CostModel.ComputeAllocation: ingesting UID data from KSM metrics...")
 	}
 
-	err := cm.buildPodMap(window, podMap, ingestPodUID, podUIDKeyMap)
+	err := cm.buildPodMapWithPushdown(window, podMap, ingestPodUID, podUIDKeyMap, pushdown)
 	if err != nil {
 		log.Errorf("CostModel.ComputeAllocation: failed to build pod map: %s", err.Error())
 	}
@@ -270,7 +318,7 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 	}
 
 	grp := source.NewQueryGroup()
-	ds := cm.DataSource.Metrics()
+	ds := cm.allocationMetricsQuerier(pushdown)
 
 	resChRAMBytesAllocated := source.WithGroup(grp, ds.QueryRAMBytesAllocated(start, end))
 	resChRAMRequests := source.WithGroup(grp, ds.QueryRAMRequests(start, end))
@@ -282,13 +330,10 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 	resChCPURequests := source.WithGroup(grp, ds.QueryCPURequests(start, end))
 	resChCPULimits := source.WithGroup(grp, ds.QueryCPULimits(start, end))
 	resChCPUUsageAvg := source.WithGroup(grp, ds.QueryCPUUsageAvg(start, end))
-	resChCPUUsageMax := source.WithGroup(grp, ds.QueryCPUUsageMax(start, end))
-	resCPUUsageMax, _ := resChCPUUsageMax.Await()
-	// This avoids logspam if there is no data for either metric (e.g. if
-	// the Prometheus didn't exist in the queried window of time).
-	if len(resCPUUsageMax) > 0 {
-		log.Debugf("CPU usage recording rule query returned an empty result when queried at %s over %s. Fell back to subquery. Consider setting up Kubecost CPU usage recording role to reduce query load on Prometheus; subqueries are expensive.", end.String(), durStr)
-	}
+	cpuUsageMaxFutureCh := make(chan *source.Future[source.CPUUsageMaxResult], 1)
+	go func() {
+		cpuUsageMaxFutureCh <- ds.QueryCPUUsageMax(start, end)
+	}()
 
 	// GPU Queries
 	resChIsGpuShared := source.WithGroup(grp, ds.QueryIsGPUShared(start, end))
@@ -359,6 +404,8 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 	resCPURequests, _ := resChCPURequests.Await()
 	resCPULimits, _ := resChCPULimits.Await()
 	resCPUUsageAvg, _ := resChCPUUsageAvg.Await()
+	resChCPUUsageMax := <-cpuUsageMaxFutureCh
+	resCPUUsageMax, cpuUsageMaxErr := resChCPUUsageMax.Await()
 	resRAMBytesAllocated, _ := resChRAMBytesAllocated.Await()
 	resRAMRequests, _ := resChRAMRequests.Await()
 	resRAMLimits, _ := resChRAMLimits.Await()
@@ -418,6 +465,11 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 	resJobLabels, _ := resChJobLabels.Await()
 	resLBCostPerHr, _ := resChLBCostPerHr.Await()
 	resLBActiveMins, _ := resChLBActiveMins.Await()
+
+	if cpuUsageMaxErr != nil {
+		log.Errorf("CostModel.ComputeAllocation: CPU usage max query error %s", cpuUsageMaxErr)
+		return allocSet, nil, cpuUsageMaxErr
+	}
 
 	if grp.HasErrors() {
 		for _, err := range grp.Errors() {
@@ -552,5 +604,23 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 		}
 	}
 
+	if cm.allocStepCache != nil {
+		cm.allocStepCache.Set(allocStepCacheKeyWithPushdown(start, end, resolution, pushdown), &allocStepCacheValue{
+			allocSet: allocSet.Clone(),
+			nodeMap:  cloneNodeMap(nodeMap),
+		}, allocStepCacheTTL(end))
+	}
+
 	return allocSet, nodeMap, nil
+}
+
+func (cm *CostModel) allocationMetricsQuerier(pushdown *allocationQueryPushdown) source.MetricsQuerier {
+	ds := cm.DataSource.Metrics()
+	if pushdown == nil || pushdown.empty() {
+		return ds
+	}
+	if filterable, ok := ds.(allocationPushdownMetricsQuerier); ok {
+		return filterable.WithAllocationFilter(pushdown.cluster, pushdown.namespace)
+	}
+	return ds
 }

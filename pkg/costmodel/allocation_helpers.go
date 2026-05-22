@@ -38,11 +38,15 @@ const (
 /* Pod Helpers */
 
 func (cm *CostModel) buildPodMap(window opencost.Window, podMap map[podKey]*pod, ingestPodUID bool, podUIDKeyMap map[podKey][]podKey) error {
+	return cm.buildPodMapWithPushdown(window, podMap, ingestPodUID, podUIDKeyMap, nil)
+}
+
+func (cm *CostModel) buildPodMapWithPushdown(window opencost.Window, podMap map[podKey]*pod, ingestPodUID bool, podUIDKeyMap map[podKey][]podKey, pushdown *allocationQueryPushdown) error {
 	// Assumes that window is positive and closed
 	start, end := *window.Start(), *window.End()
 
 	grp := source.NewQueryGroup()
-	ds := cm.DataSource.Metrics()
+	ds := cm.allocationMetricsQuerier(pushdown)
 	resolution := cm.DataSource.Resolution()
 
 	var resPods []*source.PodsResult
@@ -1154,21 +1158,21 @@ func resToPodLabels(resPodLabels []*source.PodLabelsResult, podUIDKeyMap map[pod
 	return podLabels
 }
 
-func resToNamespaceAnnotations(resNamespaceAnnotations []*source.NamespaceAnnotationsResult) map[string]map[string]string {
-	namespaceAnnotations := map[string]map[string]string{}
+func resToNamespaceAnnotations(resNamespaceAnnotations []*source.NamespaceAnnotationsResult) map[namespaceKey]map[string]string {
+	namespaceAnnotations := map[namespaceKey]map[string]string{}
 
 	for _, res := range resNamespaceAnnotations {
-		namespace := res.Namespace
-		if namespace == "" {
+		nsKey, err := newResultNamespaceKey(res.Cluster, res.Namespace)
+		if err != nil {
 			continue
 		}
 
-		if _, ok := namespaceAnnotations[namespace]; !ok {
-			namespaceAnnotations[namespace] = map[string]string{}
+		if _, ok := namespaceAnnotations[nsKey]; !ok {
+			namespaceAnnotations[nsKey] = map[string]string{}
 		}
 
 		for k, l := range res.Annotations {
-			namespaceAnnotations[namespace][k] = l
+			namespaceAnnotations[nsKey][k] = l
 		}
 	}
 
@@ -1255,7 +1259,7 @@ func applyLabels(podMap map[podKey]*pod, nodeLabels map[nodeKey]map[string]strin
 	}
 }
 
-func applyAnnotations(podMap map[podKey]*pod, namespaceAnnotations map[string]map[string]string, podAnnotations map[podKey]map[string]string) {
+func applyAnnotations(podMap map[podKey]*pod, namespaceAnnotations map[namespaceKey]map[string]string, podAnnotations map[podKey]map[string]string) {
 	for key, pod := range podMap {
 		for _, alloc := range pod.Allocations {
 			allocAnnotations := alloc.Properties.Annotations
@@ -1270,7 +1274,8 @@ func applyAnnotations(podMap map[podKey]*pod, namespaceAnnotations map[string]ma
 
 			// Apply namespace annotations first, then pod annotations so that
 			// pod labels overwrite namespace labels.
-			if labels, ok := namespaceAnnotations[key.Namespace]; ok {
+			nsKey := key.namespaceKey
+			if labels, ok := namespaceAnnotations[nsKey]; ok {
 				for k, v := range labels {
 					allocAnnotations[k] = v
 					nsAnnotations[k] = v
