@@ -480,11 +480,10 @@ type SummaryAllocationToplineItem struct {
 // @Tags         Allocation
 // @Description  兼容 Kubecost allocation/summary/topline 的概览接口，返回整个查询窗口的 combined total 摘要。
 // @Description  适合顶部卡片、总览页和趋势页头部指标。返回结构固定为 numResults + combined.allocations.total。
-// @Description  当前仅支持 window、aggregate、filter、idle、idleByNode、shareIdle、accumulate、step、resolution。
+// @Description  当前仅支持 window、aggregate、filter、idle、idleByNode、shareIdle、accumulate、step。
 // @Param        window                     query  string  true   "时间窗口。必填。示例：window=7d、window=1d、window=2026-05-01T00:00:00Z,2026-05-08T00:00:00Z"
 // @Param        aggregate                  query  string  false  "聚合维度。支持 namespace、cluster、node、controllerKind、controller、pod、container、label:<key>、annotation:<key>。示例：aggregate=namespace"
 // @Param        filter                     query  string  false  "分配过滤条件。语法与 /allocation 保持一致。示例：filter=cluster:%22host%22%2Bnamespace:%22default%22"
-// @Param        resolution                 query  string  false  "Prometheus 查询分辨率。默认 1m。示例：resolution=5m"
 // @Param        step                       query  string  false  "查询步长。默认等于整个 window。示例：step=1d"
 // @Param        accumulate                 query  string  false  "累计粒度。支持：true、all、hour、day、week、month。该接口最终始终返回整个窗口的 combined total，但会按该粒度先组织分配集合。示例：accumulate=day"
 // @Param        idle                       query  bool    false  "是否包含 idle 成本。示例：idle=true"

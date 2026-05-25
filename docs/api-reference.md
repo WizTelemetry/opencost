@@ -136,7 +136,6 @@ GET /kapis/costwise.wiztelemetry.io/v1alpha1/allocation/summary?window=7d&aggreg
 | `window` | string | **是** | — | 时间窗口 |
 | `aggregate` | string | 否 | — | 聚合维度 |
 | `filter` | string | 否 | — | 分配过滤条件 |
-| `resolution` | string | 否 | `1m` | Prometheus 查询分辨率。示例：`5m` |
 | `step` | string | 否 | window 大小 | 查询步长 |
 | `accumulate` | string | 否 | — | 中间累积粒度。接口始终返回整个窗口的 combined total |
 | `idle` | bool | 否 | false | 是否包含 idle 成本 |
@@ -205,8 +204,9 @@ GET /kapis/costwise.wiztelemetry.io/v1alpha1/allocation/autocomplete?window=7d&f
 | `aggregate` | string | 否 | — | 聚合维度。当前仅支持 `type`。不传返回原始 AssetSet |
 | `step` | string | 否 | — | 固定时间桶宽度（仅在 `aggregate=type` 时生效） |
 | `accumulate` | string | 否 | — | 时间累积方式（仅在 `aggregate=type` 时生效）。`true`、`all`、`day`、`week`、`month` |
+| `format` | string | 否 | json | 返回格式；传 `csv` 导出 CSV |
 
-> `step` 和 `accumulate` 互斥。CSV 导出：`format=csv`。
+> `step` 和 `accumulate` 互斥。
 
 **使用示例：**
 
@@ -238,6 +238,7 @@ GET /kapis/costwise.wiztelemetry.io/v1alpha1/assets?window=7d&aggregate=type&acc
 | `filter` | string | 否 | — | 资产过滤条件 |
 | `offset` | int | 否 | 0 | 每个时间片跳过前 N 个条目（分页/查看 TopN 之后） |
 | `limit` | int | 否 | 25 | 每个时间片返回的最大条目数 |
+| `format` | string | 否 | json | 返回格式；传 `csv` 导出 CSV |
 
 > 每个时间片返回 `totalCost`（所有项的总成本）+ `items`（按成本降序排列的聚合项）。
 

@@ -25,6 +25,7 @@ import (
 // @Param        aggregate  query  string  false  "聚合维度。当前仅支持 type。留空时返回原始资产集合；传 type 时返回按资产类型聚合后的结果。示例：aggregate=type"
 // @Param        step       query  string  false  "固定时间桶宽度。仅在传 aggregate=type 时生效。支持 Go duration 风格，如 12h、24h。用于按固定时长切分窗口；不能与 accumulate 同时使用。示例：window=7d&aggregate=type&step=12h"
 // @Param        accumulate query  string  false  "时间累积方式。仅在传 aggregate=type 时生效。支持：true、all、day、week、month。含义：按自然时间粒度或整个窗口累积；不能与 step 同时使用。示例：accumulate=all 返回整个窗口的汇总；accumulate=day 返回按天累积"
+// @Param        format     query  string  false  "返回格式；传 csv 导出 CSV。"
 // @Success      200  {object}  costmodel.Response
 // @Failure      400  {object}  costmodel.Response
 // @Failure      500  {object}  costmodel.Response
@@ -143,6 +144,7 @@ func (a *Accesses) ComputeAssetsHandler(w http.ResponseWriter, r *http.Request, 
 // @Param        filter     query  string  false  "资产过滤条件，使用声明式过滤语法。支持字段：assetType、name、category、cluster、project、provider、providerID、account、service、label[<key>]。常用操作：等于 field:%22value%22，不等于 field!:%22value%22，包含 field~:%22value%22，前缀 field<~:%22prefix%22；AND 使用 +，OR 使用 |。示例：filter=assetType:%22node%22、filter=provider:%22aws%22%2BassetType:%22disk%22、filter=cluster:%22prod%22%2Blabel[team]:%22platform%22。注意：URL 中 + 建议编码为 %2B，避免被解释为空格"
 // @Param        offset     query  int     false  "图表项偏移量。默认 0。对每个时间片内按成本降序排列后的结果进行跳过，用于分页或查看 TopN 之后的条目。示例：offset=0 返回前 N 个；offset=10 表示跳过前 10 个"
 // @Param        limit      query  int     false  "每个时间片返回的最大图表项数量。默认 25。仅影响返回展示数量，不改变底层成本计算。示例：limit=10 返回每个时间片成本最高的 10 个聚合项"
+// @Param        format     query  string  false  "返回格式；传 csv 导出 CSV。"
 // @Success      200  {object}  costmodel.Response
 // @Failure      400  {object}  costmodel.Response
 // @Failure      500  {object}  costmodel.Response

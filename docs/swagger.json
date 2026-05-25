@@ -617,7 +617,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/allocation/summary/topline": {
       "get": {
-        "description": "兼容 Kubecost allocation/summary/topline 的概览接口，返回整个查询窗口的 combined total 摘要。\n适合顶部卡片、总览页和趋势页头部指标。返回结构固定为 numResults + combined.allocations.total。\n当前仅支持 window、aggregate、filter、idle、idleByNode、shareIdle、accumulate、step、resolution。",
+        "description": "兼容 Kubecost allocation/summary/topline 的概览接口，返回整个查询窗口的 combined total 摘要。\n适合顶部卡片、总览页和趋势页头部指标。返回结构固定为 numResults + combined.allocations.total。\n当前仅支持 window、aggregate、filter、idle、idleByNode、shareIdle、accumulate、step。",
         "tags": [
           "Allocation"
         ],
@@ -643,14 +643,6 @@
           {
             "description": "分配过滤条件。语法与 /allocation 保持一致。示例：filter=cluster:%22host%22%2Bnamespace:%22default%22",
             "name": "filter",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Prometheus 查询分辨率。默认 1m。示例：resolution=5m",
-            "name": "resolution",
             "in": "query",
             "schema": {
               "type": "string"
@@ -783,6 +775,14 @@
           {
             "description": "时间累积方式。仅在传 aggregate=type 时生效。支持：true、all、day、week、month。含义：按自然时间粒度或整个窗口累积；不能与 step 同时使用。示例：accumulate=all 返回整个窗口的汇总；accumulate=day 返回按天累积",
             "name": "accumulate",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "返回格式；传 csv 导出 CSV。",
+            "name": "format",
             "in": "query",
             "schema": {
               "type": "string"
@@ -962,6 +962,14 @@
             "in": "query",
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "返回格式；传 csv 导出 CSV。",
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1885,6 +1893,22 @@
             "in": "query",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "返回条目数限制。0 表示无限制。",
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "偏移量。用于分页。",
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer"
             }
           }
         ],

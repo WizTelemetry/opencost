@@ -148,6 +148,8 @@ func (s *QueryService) GetCloudCostViewGraphHandler() func(w http.ResponseWriter
 // @Param        costMetric   query  string  false  "成本指标。默认 amortizedNetCost。"
 // @Param        sortBy       query  string  false  "排序字段。"
 // @Param        sortByOrder  query  string  false  "排序方向。"
+// @Param        limit        query  int     false  "返回条目数限制。0 表示无限制。"
+// @Param        offset       query  int     false  "偏移量。用于分页。"
 // @Success      200  {object}  map[string]interface{}
 // @Failure      400  {string}  string
 // @Failure      500  {string}  string
