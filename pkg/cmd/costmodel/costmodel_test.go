@@ -83,6 +83,8 @@ func TestRegisterOpenCostUIRoutesRegistersPrefixedAndLegacyRoutes(t *testing.T) 
 		{method: http.MethodGet, path: costmodel.RoutePrefix + "/allocation/summary/topline"},
 		{method: http.MethodGet, path: "/assets/graph"},
 		{method: http.MethodGet, path: costmodel.RoutePrefix + "/assets/graph"},
+		{method: http.MethodGet, path: "/assets/autocomplete"},
+		{method: http.MethodGet, path: costmodel.RoutePrefix + "/assets/autocomplete"},
 		{method: http.MethodGet, path: "/assets/carbon"},
 		{method: http.MethodGet, path: costmodel.RoutePrefix + "/assets/carbon"},
 	}

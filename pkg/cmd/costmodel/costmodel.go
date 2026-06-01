@@ -39,6 +39,7 @@ func registerOpenCostUIRoutes(router *httprouter.Router, a *costmodel.Accesses, 
 		{path: "/allocation/summary/topline", handle: a.ComputeAllocationHandlerSummaryTopline},
 		{path: "/assets", handle: a.ComputeAssetsHandler},
 		{path: "/assets/graph", handle: a.ComputeAssetsGraphHandler},
+		{path: "/assets/autocomplete", handle: a.ComputeAssetAutocompleteHandler},
 	}
 
 	for _, route := range costmodelRoutes {

@@ -258,7 +258,34 @@ GET /kapis/costwise.wiztelemetry.io/v1alpha1/assets/graph?window=7d&aggregate=ty
 GET /kapis/costwise.wiztelemetry.io/v1alpha1/assets/graph?window=7d&aggregate=label:team&accumulate=week
 ```
 
-### 2.3 `GET /assets/carbon`
+### 2.3 `GET /assets/autocomplete`
+
+查询资产字段自动补全候选项。前端可用于资产筛选器、搜索框下拉菜单。
+
+> 仅从 `node` 和 `disk` 类型资产中提取数据。`node` 返回格式为 `cluster/node`。
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `window` | string | **是** | — | 时间窗口 |
+| `field` | string | **是** | — | 字段名。支持：`cluster`、`node`、`providerID`、`name`、`assetType`、`label`、`label[<key>]` |
+| `search` | string | 否 | — | 搜索关键字，按包含关系过滤候选项 |
+| `cluster` | string | 否 | — | 按集群过滤（会与 `filter` 做 AND 合并） |
+| `filter` | string | 否 | — | 资产过滤条件 |
+
+**使用示例：**
+
+```bash
+# 获取资产节点候选项
+GET /kapis/costwise.wiztelemetry.io/v1alpha1/assets/autocomplete?window=7d&field=node
+
+# 获取特定标签值
+GET /kapis/costwise.wiztelemetry.io/v1alpha1/assets/autocomplete?window=7d&field=label[team]&search=plat
+
+# 仅在指定集群内获取 providerID
+GET /kapis/costwise.wiztelemetry.io/v1alpha1/assets/autocomplete?window=7d&field=providerID&cluster=prod
+```
+
+### 2.4 `GET /assets/carbon`
 
 查询资产的碳足迹估算数据。
 
