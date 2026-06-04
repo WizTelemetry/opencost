@@ -4,18 +4,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/signers"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
-	"github.com/opencost/opencost/core/pkg/env"
+	"github.com/opencost/opencost/core/pkg/clustercache"
+	coreenv "github.com/opencost/opencost/core/pkg/env"
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/opencost"
 	"github.com/opencost/opencost/core/pkg/util/fileutil"
@@ -23,9 +24,8 @@ import (
 	"github.com/opencost/opencost/core/pkg/util/stringutil"
 	"github.com/opencost/opencost/pkg/cloud/models"
 	"github.com/opencost/opencost/pkg/cloud/utils"
-	"github.com/opencost/opencost/pkg/clustercache"
 
-	ocenv "github.com/opencost/opencost/pkg/env"
+	"github.com/opencost/opencost/pkg/env"
 	"golang.org/x/exp/slices"
 )
 
@@ -61,8 +61,8 @@ const (
 )
 
 var (
-	// Regular expression to get the numerical value of PV suffix with GiB from *v1.PersistentVolume.
-	sizeRegEx = regexp.MustCompile("(.*?)Gi")
+	// sizeRegEx parses a PV capacity string into a numeric part and an optional binary SI suffix (Ki, Mi, Gi, Ti).
+	sizeRegEx = regexp.MustCompile(`^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)?$`)
 )
 
 // Variable to keep track of instance families that fail in DescribePrice API due improper defaulting of systemDisk if the information is not available
@@ -330,10 +330,10 @@ func (alibaba *Alibaba) GetAlibabaAccessKey() (*credentials.AccessKeyCredential,
 	}
 
 	if config.AlibabaServiceKeyName == "" {
-		config.AlibabaServiceKeyName = ocenv.GetAlibabaAccessKeyID()
+		config.AlibabaServiceKeyName = env.GetAlibabaAccessKeyID()
 	}
 	if config.AlibabaServiceKeySecret == "" {
-		config.AlibabaServiceKeySecret = ocenv.GetAlibabaAccessKeySecret()
+		config.AlibabaServiceKeySecret = env.GetAlibabaAccessKeySecret()
 	}
 
 	if config.AlibabaServiceKeyName == "" && config.AlibabaServiceKeySecret == "" {
@@ -342,8 +342,8 @@ func (alibaba *Alibaba) GetAlibabaAccessKey() (*credentials.AccessKeyCredential,
 		if err != nil {
 			return nil, fmt.Errorf("unable to set the Alibaba Cloud key/secret from config file %w", err)
 		}
-		config.AlibabaServiceKeyName = ocenv.GetAlibabaAccessKeyID()
-		config.AlibabaServiceKeySecret = ocenv.GetAlibabaAccessKeySecret()
+		config.AlibabaServiceKeyName = env.GetAlibabaAccessKeyID()
+		config.AlibabaServiceKeySecret = env.GetAlibabaAccessKeySecret()
 	}
 
 	if config.AlibabaServiceKeyName == "" && config.AlibabaServiceKeySecret == "" {
@@ -571,11 +571,21 @@ func (alibaba *Alibaba) NetworkPricing() (*models.Network, error) {
 	if err != nil {
 		return nil, err
 	}
+	nge, err := strconv.ParseFloat(cpricing.NatGatewayEgress, 64)
+	if err != nil {
+		return nil, err
+	}
+	ngi, err := strconv.ParseFloat(cpricing.NatGatewayIngress, 64)
+	if err != nil {
+		return nil, err
+	}
 
 	return &models.Network{
 		ZoneNetworkEgressCost:     znec,
 		RegionNetworkEgressCost:   rnec,
 		InternetNetworkEgressCost: inec,
+		NatGatewayEgressCost:      nge,
+		NatGatewayIngressCost:     ngi,
 	}, nil
 }
 
@@ -606,9 +616,6 @@ func (alibaba *Alibaba) GetConfig() (*models.CustomPricing, error) {
 	if c.NegotiatedDiscount == "" {
 		c.NegotiatedDiscount = "0%"
 	}
-	if c.ShareTenancyCosts == "" {
-		c.ShareTenancyCosts = models.DefaultShareTenancyCost
-	}
 
 	return c, nil
 }
@@ -637,13 +644,13 @@ func (alibaba *Alibaba) loadAlibabaAuthSecretAndSetEnv(force bool) error {
 		return fmt.Errorf("failed to unmarshall access key id and access key secret with err: %w", err)
 	}
 
-	err = env.Set(ocenv.AlibabaAccessKeyIDEnvVar, ak.AccessKeyID)
+	err = coreenv.Set(env.AlibabaAccessKeyIDEnvVar, ak.AccessKeyID)
 	if err != nil {
-		return fmt.Errorf("failed to set environment variable: %s with err: %w", ocenv.AlibabaAccessKeyIDEnvVar, err)
+		return fmt.Errorf("failed to set environment variable: %s with err: %w", env.AlibabaAccessKeyIDEnvVar, err)
 	}
-	err = env.Set(ocenv.AlibabaAccessKeySecretEnvVar, ak.SecretAccessKey)
+	err = coreenv.Set(env.AlibabaAccessKeySecretEnvVar, ak.SecretAccessKey)
 	if err != nil {
-		return fmt.Errorf("failed to set environment variable: %s with err: %w", ocenv.AlibabaAccessKeySecretEnvVar, err)
+		return fmt.Errorf("failed to set environment variable: %s with err: %w", env.AlibabaAccessKeySecretEnvVar, err)
 	}
 
 	alibaba.accessKey = &credentials.AccessKeyCredential{
@@ -656,7 +663,7 @@ func (alibaba *Alibaba) loadAlibabaAuthSecretAndSetEnv(force bool) error {
 // Regions returns a current supported list of Alibaba regions
 func (alibaba *Alibaba) Regions() []string {
 
-	regionOverrides := ocenv.GetRegionOverrideList()
+	regionOverrides := env.GetRegionOverrideList()
 
 	if len(regionOverrides) > 0 {
 		log.Debugf("Overriding Alibaba regions with configured region list: %+v", regionOverrides)
@@ -681,7 +688,7 @@ func (alibaba *Alibaba) ClusterInfo() (map[string]string, error) {
 
 	// Set it to environment clusterID if not set at this point
 	if clusterName == "" {
-		clusterName = ocenv.GetClusterID()
+		clusterName = coreenv.GetClusterID()
 	}
 
 	m := make(map[string]string)
@@ -689,7 +696,7 @@ func (alibaba *Alibaba) ClusterInfo() (map[string]string, error) {
 	m["provider"] = opencost.AlibabaProvider
 	m["project"] = alibaba.ClusterAccountId
 	m["region"] = alibaba.ClusterRegion
-	m["id"] = ocenv.GetClusterID()
+	m["id"] = coreenv.GetClusterID()
 	return m, nil
 }
 
@@ -732,8 +739,8 @@ func (alibaba *Alibaba) UpdateConfig(r io.Reader, updateType string) (*models.Cu
 			}
 		}
 
-		if ocenv.IsRemoteEnabled() {
-			err := utils.UpdateClusterMeta(ocenv.GetClusterID(), c.ClusterName)
+		if env.IsRemoteEnabled() {
+			err := utils.UpdateClusterMeta(coreenv.GetClusterID(), c.ClusterName)
 			if err != nil {
 				return err
 			}
@@ -749,11 +756,6 @@ func (alibaba *Alibaba) UpdateConfigFromConfigMap(cm map[string]string) (*models
 // Will look at this in Next PR if needed
 func (alibaba *Alibaba) GetManagementPlatform() (string, error) {
 	return "", nil
-}
-
-// Will look at this in Next PR if needed
-func (alibaba *Alibaba) GetLocalStorageQuery(window, offset time.Duration, rate bool, used bool) string {
-	return ""
 }
 
 // Will look at this in Next PR if needed
@@ -1079,6 +1081,10 @@ func processDescribePriceAndCreateAlibabaPricing(client *sdk.Client, i interface
 	pricing = &AlibabaPricing{}
 	var response DescribePriceResponse
 
+	if client == nil {
+		return nil, fmt.Errorf("nil client passed to process the pricing information")
+	}
+
 	if i == nil {
 		return nil, fmt.Errorf("nil component passed to process the pricing information")
 	}
@@ -1214,6 +1220,11 @@ func getSystemDiskInfoOfANode(instanceID, regionID string, client *sdk.Client, s
 	if instanceID == "" {
 		return
 	}
+	// if client is nil return an empty disk to not impact default pricing
+	if client == nil {
+		log.Warnf("unable to set the signer for node with providerID %s to retrieve the key skipping SystemDisk Retrieval with err: nil client", instanceID)
+		return
+	}
 	req, err := createDescribeDisksACSRequest(instanceID, regionID, ALIBABA_SYSTEM_DISK_CATEGORY)
 	// if any error occurs return an empty disk to not impact default pricing.
 	if err != nil {
@@ -1286,21 +1297,57 @@ func generateSlimK8sNodeFromV1Node(node *clustercache.Node) *SlimK8sNode {
 	return NewSlimK8sNode(instanceType, regionID, priceUnit, memorySizeInKiB, osType, providerID, instanceFamily, IsIoOptimized, systemDisk)
 }
 
-// getNumericalValueFromResourceQuantity returns the numericalValue of the resourceQuantity
-// An example is: 20Gi returns to 20. If any error occurs it returns the default value used in describePrice API which is 2000.
+// getNumericalValueFromResourceQuantity converts a Kubernetes PV capacity string (e.g. "20Gi", "48828125Ki")
+// into a whole GiB integer string, as required by the Alibaba DescribePrice API.
+// Returns ALIBABA_DEFAULT_DATADISK_SIZE if the quantity cannot be parsed.
 func getNumericalValueFromResourceQuantity(quantity string) (value string) {
-	// defaulting when any panic or empty string occurs.
 	defer func() {
-		log.Debugf("unable to determine the size of the PV so defaulting the size to %s", ALIBABA_DEFAULT_DATADISK_SIZE)
 		if err := recover(); err != nil {
+			log.Debugf("panic while parsing PV capacity %q, defaulting to %s: %v", quantity, ALIBABA_DEFAULT_DATADISK_SIZE, err)
 			value = ALIBABA_DEFAULT_DATADISK_SIZE
 		}
 		if value == "" {
+			log.Debugf("unable to determine the size of the PV from quantity %q, defaulting to %s", quantity, ALIBABA_DEFAULT_DATADISK_SIZE)
 			value = ALIBABA_DEFAULT_DATADISK_SIZE
 		}
 	}()
-	res := sizeRegEx.FindAllStringSubmatch(quantity, 1)
-	value = res[0][1]
+
+	res := sizeRegEx.FindStringSubmatch(strings.TrimSpace(quantity))
+	if len(res) < 2 || res[1] == "" {
+		return
+	}
+
+	numericPart, err := strconv.ParseFloat(res[1], 64)
+	if err != nil || numericPart <= 0 {
+		return
+	}
+
+	unit := ""
+	if len(res) >= 3 {
+		unit = res[2]
+	}
+
+	var sizeInGiB float64
+	switch unit {
+	case "Ki":
+		sizeInGiB = numericPart / (1024 * 1024)
+	case "Mi":
+		sizeInGiB = numericPart / 1024
+	case "Gi":
+		sizeInGiB = numericPart
+	case "Ti":
+		sizeInGiB = numericPart * 1024
+	default:
+		sizeInGiB = numericPart / (1024 * 1024 * 1024)
+	}
+
+	// ceil so we never underreport disk size to the DescribePrice API.
+	sizeInGiBInt := int64(math.Ceil(sizeInGiB))
+	if sizeInGiBInt <= 0 {
+		return
+	}
+
+	value = strconv.FormatInt(sizeInGiBInt, 10)
 	return
 }
 
@@ -1397,7 +1444,7 @@ func determinePVRegion(pv *clustercache.PersistentVolume) string {
 		}
 	}
 
-	regionOverrides := ocenv.GetRegionOverrideList()
+	regionOverrides := env.GetRegionOverrideList()
 	regions := alibabaRegions
 
 	if len(regionOverrides) > 0 {

@@ -8,13 +8,41 @@ import (
 	"github.com/opencost/opencost/core/pkg/opencost"
 )
 
+// clampTimeToRange does not permit timestamps to exceed a given start, end
+// range, inclusive of start and end times. For examples:
+//
+// If time is within (start, end) inclusive, return that time:
+//
+// >      S----T-------------E      => T
+//
+// If time is before start, return start:
+//
+// >   T  S------------------E      => S
+//
+// If time is after end, return end:
+//
+// >      S------------------E   T  => E
+//
+// Note: if this function encounters a "zero" time (either time.Zero or Unix
+// timestamp 0) the time returned will be the given start time.
+func clampTimeToRange(t time.Time, start, end time.Time) time.Time {
+	if t.Before(start) {
+		return start
+	}
+
+	if t.After(end) {
+		return end
+	}
+
+	return t
+}
+
 func (cm *CostModel) ComputeAssets(start, end time.Time) (*opencost.AssetSet, error) {
 	assetSet := opencost.NewAssetSet(start, end)
 
 	nodeMap, err := cm.ClusterNodes(start, end)
 	if err != nil {
 		return nil, fmt.Errorf("error computing node assets for %s: %w", opencost.NewClosedWindow(start, end), err)
-
 	}
 
 	lbMap, err := cm.ClusterLoadBalancers(start, end)
@@ -27,18 +55,18 @@ func (cm *CostModel) ComputeAssets(start, end time.Time) (*opencost.AssetSet, er
 		return nil, fmt.Errorf("error computing disk assets for %s: %w", opencost.NewClosedWindow(start, end), err)
 	}
 
-	for _, d := range diskMap {
-		s := d.Start
-		if s.Before(start) || s.After(end) {
-			log.Debugf("CostModel.ComputeAssets: disk '%s' start outside window: %s not in [%s, %s]", d.Name, s.Format("2006-01-02T15:04:05"), start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05"))
-			s = start
-		}
+	clusterManagement, err := cm.ClusterManagement(start, end)
+	if err != nil {
+		return nil, fmt.Errorf("error computing cluster management assets for %s: %w", opencost.NewClosedWindow(start, end), err)
+	}
 
-		e := d.End
-		if e.Before(start) || e.After(end) {
-			log.Debugf("CostModel.ComputeAssets: disk '%s' end outside window: %s not in [%s, %s]", d.Name, e.Format("2006-01-02T15:04:05"), start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05"))
-			e = end
-		}
+	for _, d := range diskMap {
+		// Clamp the start and end fields to the start and end of the window.
+		// In the case that start and end are missing (e.g. due to the "active
+		// minutes" metric being absent), both times will be set to the start
+		// of the window -- representing zero "runtime" within the window.
+		s := clampTimeToRange(d.Start, start, end)
+		e := clampTimeToRange(d.End, start, end)
 
 		hours := e.Sub(s).Hours()
 
@@ -72,22 +100,26 @@ func (cm *CostModel) ComputeAssets(start, end time.Time) (*opencost.AssetSet, er
 	}
 
 	for _, lb := range lbMap {
-		s := lb.Start
-		if s.Before(start) || s.After(end) {
-			log.Debugf("CostModel.ComputeAssets: load balancer '%s' start outside window: %s not in [%s, %s]", lb.Name, s.Format("2006-01-02T15:04:05"), start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05"))
-			s = start
-		}
-
-		e := lb.End
-		if e.Before(start) || e.After(end) {
-			log.Debugf("CostModel.ComputeAssets: load balancer '%s' end outside window: %s not in [%s, %s]", lb.Name, e.Format("2006-01-02T15:04:05"), start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05"))
-			e = end
-		}
+		// Clamp the start and end fields to the start and end of the window.
+		// In the case that start and end are missing (e.g. due to the "active
+		// minutes" metric being absent), both times will be set to the start
+		// of the window -- representing zero "runtime" within the window.
+		s := clampTimeToRange(lb.Start, start, end)
+		e := clampTimeToRange(lb.End, start, end)
 
 		loadBalancer := opencost.NewLoadBalancer(lb.Name, lb.Cluster, lb.ProviderID, s, e, opencost.NewWindow(&start, &end), lb.Private, lb.Ip)
 		cm.PropertiesFromCluster(loadBalancer.Properties)
 		loadBalancer.Cost = lb.Cost
+
 		assetSet.Insert(loadBalancer, nil)
+	}
+
+	for _, cman := range clusterManagement {
+		cmAsset := opencost.NewClusterManagement(cman.Provisioner, cman.Cluster, opencost.NewClosedWindow(start, end))
+		cm.PropertiesFromCluster(cmAsset.Properties)
+		cmAsset.Cost = cman.Cost
+
+		assetSet.Insert(cmAsset, nil)
 	}
 
 	for _, n := range nodeMap {
@@ -97,17 +129,13 @@ func (cm *CostModel) ComputeAssets(start, end time.Time) (*opencost.AssetSet, er
 				continue
 			}
 		}
-		s := n.Start
-		if s.Before(start) || s.After(end) {
-			log.Debugf("CostModel.ComputeAssets: node '%s' start outside window: %s not in [%s, %s]", n.Name, s.Format("2006-01-02T15:04:05"), start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05"))
-			s = start
-		}
 
-		e := n.End
-		if e.Before(start) || e.After(end) {
-			log.Debugf("CostModel.ComputeAssets: node '%s' end outside window: %s not in [%s, %s]", n.Name, e.Format("2006-01-02T15:04:05"), start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05"))
-			e = end
-		}
+		// Clamp the start and end fields to the start and end of the window.
+		// In the case that start and end are missing (e.g. due to the "active
+		// minutes" metric being absent), both times will be set to the start
+		// of the window -- representing zero "runtime" within the window.
+		s := clampTimeToRange(n.Start, start, end)
+		e := clampTimeToRange(n.End, start, end)
 
 		hours := e.Sub(s).Hours()
 
@@ -156,15 +184,19 @@ func (cm *CostModel) ComputeAssets(start, end time.Time) (*opencost.AssetSet, er
 }
 
 func (cm *CostModel) ClusterDisks(start, end time.Time) (map[DiskIdentifier]*Disk, error) {
-	return ClusterDisks(cm.PrometheusClient, cm.Provider, start, end)
+	return ClusterDisks(cm.DataSource, cm.Provider, start, end)
 }
 
 func (cm *CostModel) ClusterLoadBalancers(start, end time.Time) (map[LoadBalancerIdentifier]*LoadBalancer, error) {
-	return ClusterLoadBalancers(cm.PrometheusClient, start, end)
+	return ClusterLoadBalancers(cm.DataSource, start, end)
 }
 
 func (cm *CostModel) ClusterNodes(start, end time.Time) (map[NodeIdentifier]*Node, error) {
-	return ClusterNodes(cm.Provider, cm.PrometheusClient, start, end)
+	return ClusterNodes(cm.DataSource, cm.Provider, start, end)
+}
+
+func (cm *CostModel) ClusterManagement(start, end time.Time) (map[ClusterManagementIdentifier]*ClusterManagementCost, error) {
+	return ClusterManagement(cm.DataSource, start, end)
 }
 
 // propertiesFromCluster populates static cluster properties to individual asset properties

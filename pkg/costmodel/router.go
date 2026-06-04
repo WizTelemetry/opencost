@@ -2,53 +2,47 @@ package costmodel
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
-	"path"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/microcosm-cc/bluemonday"
-	"github.com/opencost/opencost/core/pkg/opencost"
-	"github.com/opencost/opencost/core/pkg/util/httputil"
+	"github.com/opencost/opencost/core/pkg/kubeconfig"
+	"github.com/opencost/opencost/core/pkg/nodestats"
+	"github.com/opencost/opencost/core/pkg/protocol"
+	"github.com/opencost/opencost/core/pkg/source"
+	"github.com/opencost/opencost/core/pkg/storage"
+	"github.com/opencost/opencost/core/pkg/util/retry"
 	"github.com/opencost/opencost/core/pkg/util/timeutil"
 	"github.com/opencost/opencost/core/pkg/version"
-	"github.com/opencost/opencost/pkg/cloud/aws"
 	cloudconfig "github.com/opencost/opencost/pkg/cloud/config"
-	"github.com/opencost/opencost/pkg/cloud/gcp"
 	"github.com/opencost/opencost/pkg/cloud/provider"
 	"github.com/opencost/opencost/pkg/cloudcost"
 	"github.com/opencost/opencost/pkg/config"
-	clustermap "github.com/opencost/opencost/pkg/costmodel/clusters"
 	"github.com/opencost/opencost/pkg/customcost"
-	"github.com/opencost/opencost/pkg/kubeconfig"
 	"github.com/opencost/opencost/pkg/metrics"
-	"github.com/opencost/opencost/pkg/services"
 	"github.com/opencost/opencost/pkg/util/watcher"
 
 	"github.com/julienschmidt/httprouter"
 
-	"github.com/getsentry/sentry-go"
-
+	"github.com/opencost/opencost/core/pkg/clustercache"
 	"github.com/opencost/opencost/core/pkg/clusters"
 	sysenv "github.com/opencost/opencost/core/pkg/env"
 	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/opencost"
 	"github.com/opencost/opencost/core/pkg/util/json"
-	"github.com/opencost/opencost/pkg/cloud/azure"
+	"github.com/opencost/opencost/modules/collector-source/pkg/collector"
+	"github.com/opencost/opencost/modules/prometheus-source/pkg/prom"
 	"github.com/opencost/opencost/pkg/cloud/models"
-	"github.com/opencost/opencost/pkg/cloud/utils"
-	"github.com/opencost/opencost/pkg/clustercache"
+	clusterc "github.com/opencost/opencost/pkg/clustercache"
 	"github.com/opencost/opencost/pkg/env"
-	"github.com/opencost/opencost/pkg/errors"
-	"github.com/opencost/opencost/pkg/prom"
-	"github.com/opencost/opencost/pkg/thanos"
-	prometheus "github.com/prometheus/client_golang/api"
-	prometheusAPI "github.com/prometheus/client_golang/api/prometheus/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/patrickmn/go-cache"
@@ -56,29 +50,32 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-var sanitizePolicy = bluemonday.UGCPolicy()
-
 const (
 	RFC3339Milli         = "2006-01-02T15:04:05.000Z"
-	maxCacheMinutes1d    = 11
-	maxCacheMinutes2d    = 17
-	maxCacheMinutes7d    = 37
-	maxCacheMinutes30d   = 137
 	CustomPricingSetting = "CustomPricing"
 	DiscountSetting      = "Discount"
-	epRules              = apiPrefix + "/rules"
+	RoutePrefix          = "/kapis/costwise.wiztelemetry.io/v1alpha1"
+	defaultQueryCacheTTL = 60 * time.Second
+	queryCacheTTLEnvVar  = "OPENCOST_QUERY_CACHE_TTL_SECONDS"
+
+	// New env vars for per-class TTL overrides
+	realtimeQueryCacheTTLEnvVar    = "OPENCOST_REALTIME_QUERY_CACHE_TTL_SECONDS"
+	historicalQueryCacheTTLEnvVar  = "OPENCOST_HISTORICAL_QUERY_CACHE_TTL_SECONDS"
+	defaultRealtimeQueryCacheTTL   = 30 * time.Second
+	defaultHistoricalQueryCacheTTL = 5 * time.Minute
 )
 
 var (
 	// gitCommit is set by the build system
 	gitCommit string
+
+	proto = protocol.HTTP()
 )
 
 // Accesses defines a singleton application instance, providing access to
 // Prometheus, Kubernetes, the cloud provider, and caches.
 type Accesses struct {
-	PrometheusClient    prometheus.Client
-	ThanosClient        prometheus.Client
+	DataSource          source.OpenCostDataSource
 	KubeClientSet       kubernetes.Interface
 	ClusterCache        clustercache.ClusterCache
 	ClusterMap          clusters.ClusterMap
@@ -87,117 +84,156 @@ type Accesses struct {
 	ClusterInfoProvider clusters.ClusterInfoProvider
 	Model               *CostModel
 	MetricsEmitter      *CostModelMetricsEmitter
-	OutOfClusterCache   *cache.Cache
-	AggregateCache      *cache.Cache
-	CostDataCache       *cache.Cache
-	ClusterCostsCache   *cache.Cache
-	CacheExpiration     map[time.Duration]time.Duration
-	AggAPI              Aggregator
 	// SettingsCache stores current state of app settings
 	SettingsCache *cache.Cache
+	// QueryCache stores query responses for repeated API queries
+	QueryCache *cache.Cache
 	// settingsSubscribers tracks channels through which changes to different
 	// settings will be published in a pub/sub model
 	settingsSubscribers map[string][]chan string
 	settingsMutex       sync.Mutex
-	// registered http service instances
-	httpServices services.HTTPServices
 }
 
-// GetPrometheusClient decides whether the default Prometheus client or the Thanos client
-// should be used.
-func (a *Accesses) GetPrometheusClient(remote bool) prometheus.Client {
-	// Use Thanos Client if it exists (enabled) and remote flag set
-	var pc prometheus.Client
+func newQueryCache() *cache.Cache {
+	ttl := queryCacheBaseTTL()
+	if ttl <= 0 {
+		return nil
+	}
+	return cache.New(ttl, 2*ttl)
+}
 
-	if remote && a.ThanosClient != nil {
-		pc = a.ThanosClient
-	} else {
-		pc = a.PrometheusClient
+// queryCacheBaseTTL returns the global baseline TTL from OPENCOST_QUERY_CACHE_TTL_SECONDS.
+func queryCacheBaseTTL() time.Duration {
+	seconds := sysenv.GetInt(queryCacheTTLEnvVar, int(defaultQueryCacheTTL.Seconds()))
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// realtimeQueryCacheTTL returns the near-realtime cache TTL.
+// Priority: OPENCOST_REALTIME_QUERY_CACHE_TTL_SECONDS > OPENCOST_QUERY_CACHE_TTL_SECONDS (if shorter than 30s) > 30s
+func realtimeQueryCacheTTL() time.Duration {
+	seconds := sysenv.GetInt(realtimeQueryCacheTTLEnvVar, -1)
+	if seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	// Fall back to global config
+	base := queryCacheBaseTTL()
+	if base > 0 && base < defaultRealtimeQueryCacheTTL {
+		return base
+	}
+	return defaultRealtimeQueryCacheTTL
+}
+
+// historicalQueryCacheTTL returns the historical cache TTL.
+// Priority: OPENCOST_HISTORICAL_QUERY_CACHE_TTL_SECONDS > OPENCOST_QUERY_CACHE_TTL_SECONDS (if longer than 5m) > 5m
+func historicalQueryCacheTTL() time.Duration {
+	seconds := sysenv.GetInt(historicalQueryCacheTTLEnvVar, -1)
+	if seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	// Fall back to global config
+	base := queryCacheBaseTTL()
+	if base > defaultHistoricalQueryCacheTTL {
+		return base
+	}
+	return defaultHistoricalQueryCacheTTL
+}
+
+func queryCacheKey(endpoint string, r *http.Request) string {
+	if r != nil && r.URL != nil {
+		normalized := normalizeCacheWindow(r.URL.RawQuery)
+		return fmt.Sprintf("%s:%s?%s", endpoint, canonicalCachePath(r.URL.Path), normalized)
+	}
+	return endpoint
+}
+
+func canonicalCachePath(path string) string {
+	path = strings.TrimPrefix(path, RoutePrefix)
+
+	switch path {
+	case "/allocation/compute":
+		return "/allocation"
+	case "/allocation/compute/summary":
+		return "/allocation/summary"
+	default:
+		return path
+	}
+}
+
+// normalizeCacheWindow rounds relative window parameters to 5-minute buckets
+// to improve cache hit rate for frontend polling. Absolute timestamp windows
+// are preserved unchanged.
+func normalizeCacheWindow(rawQuery string) string {
+	if rawQuery == "" {
+		return rawQuery
 	}
 
-	return pc
-}
-
-// GetCacheExpiration looks up and returns custom cache expiration for the given duration.
-// If one does not exists, it returns the default cache expiration, which is defined by
-// the particular cache.
-func (a *Accesses) GetCacheExpiration(dur time.Duration) time.Duration {
-	if expiration, ok := a.CacheExpiration[dur]; ok {
-		return expiration
-	}
-	return cache.DefaultExpiration
-}
-
-// GetCacheRefresh determines how long to wait before refreshing the cache for the given duration,
-// which is done 1 minute before we expect the cache to expire, or 1 minute if expiration is
-// not found or is less than 2 minutes.
-func (a *Accesses) GetCacheRefresh(dur time.Duration) time.Duration {
-	expiry := a.GetCacheExpiration(dur).Minutes()
-	if expiry <= 2.0 {
-		return time.Minute
-	}
-	mins := time.Duration(expiry/2.0) * time.Minute
-	return mins
-}
-
-func (a *Accesses) ClusterCostsFromCacheHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-
-	duration := 24 * time.Hour
-	offset := time.Minute
-	durationHrs := "24h"
-	fmtOffset := "1m"
-	pClient := a.GetPrometheusClient(true)
-
-	key := fmt.Sprintf("%s:%s", durationHrs, fmtOffset)
-	if data, valid := a.ClusterCostsCache.Get(key); valid {
-		clusterCosts := data.(map[string]*ClusterCosts)
-		w.Write(WrapDataWithMessage(clusterCosts, nil, "clusterCosts cache hit"))
-	} else {
-		data, err := a.ComputeClusterCosts(pClient, a.CloudProvider, duration, offset, true)
-		w.Write(WrapDataWithMessage(data, err, fmt.Sprintf("clusterCosts cache miss: %s", key)))
-	}
-}
-
-type Response struct {
-	Code    int         `json:"code"`
-	Status  string      `json:"status"`
-	Data    interface{} `json:"data"`
-	Message string      `json:"message,omitempty"`
-	Warning string      `json:"warning,omitempty"`
-}
-
-// FilterFunc is a filter that returns true iff the given CostData should be filtered out, and the environment that was used as the filter criteria, if it was an aggregate
-type FilterFunc func(*CostData) (bool, string)
-
-// FilterCostData allows through only CostData that matches all the given filter functions
-func FilterCostData(data map[string]*CostData, retains []FilterFunc, filters []FilterFunc) (map[string]*CostData, int, map[string]int) {
-	result := make(map[string]*CostData)
-	filteredEnvironments := make(map[string]int)
-	filteredContainers := 0
-DataLoop:
-	for key, datum := range data {
-		for _, rf := range retains {
-			if ok, _ := rf(datum); ok {
-				result[key] = datum
-				// if any retain function passes, the data is retained and move on
-				continue DataLoop
-			}
-		}
-		for _, ff := range filters {
-			if ok, environment := ff(datum); !ok {
-				if environment != "" {
-					filteredEnvironments[environment]++
-				}
-				filteredContainers++
-				// if any filter function check fails, move on to the next datum
-				continue DataLoop
-			}
-		}
-		result[key] = datum
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
 	}
 
-	return result, filteredContainers, filteredEnvironments
+	windowVal := values.Get("window")
+	if windowVal == "" {
+		return rawQuery
+	}
+
+	// Absolute windows contain commas (range) or timestamps with 'T'.
+	// Do not normalize them.
+	if strings.Contains(windowVal, ",") || strings.Contains(windowVal, "T") {
+		return rawQuery
+	}
+
+	// Relative window: add a bucket key truncated to 5-minute intervals.
+	bucketed := time.Now().UTC().Truncate(5 * time.Minute)
+	values.Set("__normalized_at", bucketed.Format(time.RFC3339))
+
+	return values.Encode()
+}
+
+func (a *Accesses) getQueryCacheResponse(endpoint string, r *http.Request) ([]byte, bool) {
+	if a == nil || a.QueryCache == nil {
+		return nil, false
+	}
+
+	val, found := a.QueryCache.Get(queryCacheKey(endpoint, r))
+	if !found {
+		return nil, false
+	}
+
+	resp, ok := val.([]byte)
+	return resp, ok
+}
+
+func (a *Accesses) setQueryCacheResponseWithTTL(endpoint string, r *http.Request, resp []byte, ttl time.Duration) {
+	if a == nil || a.QueryCache == nil || len(resp) == 0 {
+		return
+	}
+
+	a.QueryCache.Set(queryCacheKey(endpoint, r), resp, ttl)
+}
+
+// cacheTTLForWindow returns an appropriate cache TTL based on the query window.
+// Historical windows (ending more than 1 hour ago) use OPENCOST_HISTORICAL_QUERY_CACHE_TTL_SECONDS
+// or the global baseline if longer.
+// Near-realtime windows use OPENCOST_REALTIME_QUERY_CACHE_TTL_SECONDS or the global baseline if shorter.
+func cacheTTLForWindow(w *opencost.Window) time.Duration {
+	if w == nil || w.End() == nil {
+		return cache.DefaultExpiration
+	}
+
+	windowEnd := *w.End()
+	now := time.Now()
+
+	// Historical window: ending more than 1 hour ago
+	if windowEnd.Add(1 * time.Hour).Before(now) {
+		return historicalQueryCacheTTL()
+	}
+
+	// Near-realtime window
+	return realtimeQueryCacheTTL()
 }
 
 func filterFields(fields string, data map[string]*CostData) map[string]CostData {
@@ -228,24 +264,6 @@ func filterFields(fields string, data map[string]*CostData) map[string]CostData 
 	return filteredData
 }
 
-func normalizeTimeParam(param string) (string, error) {
-	if param == "" {
-		return "", fmt.Errorf("invalid time param")
-	}
-	// convert days to hours
-	if param[len(param)-1:] == "d" {
-		count := param[:len(param)-1]
-		val, err := strconv.ParseInt(count, 10, 64)
-		if err != nil {
-			return "", err
-		}
-		val = val * 24
-		param = fmt.Sprintf("%dh", val)
-	}
-
-	return param, nil
-}
-
 // ParsePercentString takes a string of expected format "N%" and returns a floating point 0.0N.
 // If the "%" symbol is missing, it just returns 0.0N. Empty string is interpreted as "0%" and
 // return 0.0.
@@ -265,112 +283,111 @@ func ParsePercentString(percentStr string) (float64, error) {
 	return discount, nil
 }
 
-func WrapData(data interface{}, err error) []byte {
-	var resp []byte
-
-	if err != nil {
-		log.Errorf("Error returned to client: %s", err.Error())
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusInternalServerError,
-			Status:  "error",
-			Message: err.Error(),
-			Data:    data,
-		})
-	} else {
-		resp, err = json.Marshal(&Response{
-			Code:   http.StatusOK,
-			Status: "success",
-			Data:   data,
-		})
-		if err != nil {
-			log.Errorf("error marshaling response json: %s", err.Error())
+// adminAuthMiddleware wraps a handler and requires a Bearer token matching ADMIN_TOKEN env var when set.
+// When ADMIN_TOKEN is not set, logs a deduped warning and allows the request through.
+// When ADMIN_TOKEN is set, returns 401 if the Bearer token is missing or 403 if it does not match.
+func adminAuthMiddleware(next httprouter.Handle) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		adminToken := env.GetAdminToken()
+		if adminToken == "" {
+			log.DedupedWarningf(5, "Admin token (ADMIN_TOKEN) not configured; write operations are unauthenticated")
+			next(w, r, ps)
+			return
 		}
+		authHeader := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(authHeader, prefix) {
+			http.Error(w, "Missing or invalid authorization", http.StatusUnauthorized)
+			return
+		}
+		bearerToken := strings.TrimPrefix(authHeader, prefix)
+		if subtle.ConstantTimeCompare([]byte(bearerToken), []byte(adminToken)) != 1 {
+			http.Error(w, "Missing or invalid authorization", http.StatusForbidden)
+			return
+		}
+		next(w, r, ps)
 	}
-
-	return resp
 }
 
-func WrapDataWithMessage(data interface{}, err error, message string) []byte {
-	var resp []byte
-
+func WriteData(w http.ResponseWriter, data interface{}, err error) {
 	if err != nil {
-		log.Errorf("Error returned to client: %s", err.Error())
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusInternalServerError,
-			Status:  "error",
-			Message: err.Error(),
-			Data:    data,
-		})
-	} else {
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusOK,
-			Status:  "success",
-			Data:    data,
-			Message: message,
-		})
+		proto.WriteError(w, proto.InternalServerError(err.Error()))
+		return
 	}
 
-	return resp
+	proto.WriteData(w, data)
 }
 
-func WrapDataWithWarning(data interface{}, err error, warning string) []byte {
-	var resp []byte
-
-	if err != nil {
-		log.Errorf("Error returned to client: %s", err.Error())
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusInternalServerError,
-			Status:  "error",
-			Message: err.Error(),
-			Warning: warning,
-			Data:    data,
-		})
-	} else {
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusOK,
-			Status:  "success",
-			Data:    data,
-			Warning: warning,
-		})
-	}
-
-	return resp
+func registerGETWithPrefix(router *httprouter.Router, path string, handle httprouter.Handle) {
+	router.GET(path, handle)
+	router.GET(RoutePrefix+path, handle)
 }
 
-func WrapDataWithMessageAndWarning(data interface{}, err error, message, warning string) []byte {
-	var resp []byte
-
-	if err != nil {
-		log.Errorf("Error returned to client: %s", err.Error())
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusInternalServerError,
-			Status:  "error",
-			Message: err.Error(),
-			Warning: warning,
-			Data:    data,
-		})
-	} else {
-		resp, _ = json.Marshal(&Response{
-			Code:    http.StatusOK,
-			Status:  "success",
-			Data:    data,
-			Message: message,
-			Warning: warning,
-		})
-	}
-
-	return resp
+func registerPOSTWithPrefix(router *httprouter.Router, path string, handle httprouter.Handle) {
+	router.POST(path, handle)
+	router.POST(RoutePrefix+path, handle)
 }
 
-// wrapAsObjectItems wraps a slice of items into an object containing a single items list
-// allows our k8s proxy methods to emulate a List() request to k8s API
-func wrapAsObjectItems(items interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"items": items,
-	}
+func registerAccessesRoutes(router *httprouter.Router, a *Accesses) {
+	registerGETWithPrefix(router, "/costDataModel", a.CostDataModel)
+	registerGETWithPrefix(router, "/allocation/autocomplete", a.ComputeAllocationAutocompleteHandler)
+	registerGETWithPrefix(router, "/allocation/compute", a.ComputeAllocationHandler)
+	registerGETWithPrefix(router, "/allocation/compute/summary", a.ComputeAllocationHandlerSummary)
+	registerGETWithPrefix(router, "/efficiency/clusters", a.ComputeAllocationHandlerClusterEfficiencySummary)
+	registerGETWithPrefix(router, "/efficiency/clusters/summary", a.ComputeAllocationHandlerClusterEfficiencySummary)
+	registerGETWithPrefix(router, "/efficiency", a.ComputeEfficiencyHandler)
+	registerGETWithPrefix(router, "/allNodePricing", a.GetAllNodePricing)
+	registerGETWithPrefix(router, "/customPricing", a.GetCustomPricing)
+	registerGETWithPrefix(router, "/currency", a.GetCurrency)
+	registerPOSTWithPrefix(router, "/spotUpdate", a.UpdateSpotInfoConfigs)
+	registerPOSTWithPrefix(router, "/athenaUpdate", a.UpdateAthenaInfoConfigs)
+	registerPOSTWithPrefix(router, "/bigqueryUpdate", a.UpdateBigQueryInfoConfigs)
+	registerPOSTWithPrefix(router, "/azureStorageUpdate", a.UpdateAzureStorageConfigs)
+	registerPOSTWithPrefix(router, "/updateConfigByKey", a.UpdateConfigByKey)
+	registerPOSTWithPrefix(router, "/refreshPricing", a.RefreshPricingData)
+	registerGETWithPrefix(router, "/managementPlatform", a.ManagementPlatform)
+	registerGETWithPrefix(router, "/clusterInfo", a.ClusterInfo)
+	registerGETWithPrefix(router, "/clusterInfoMap", a.GetClusterInfoMap)
+	registerGETWithPrefix(router, "/serviceAccountStatus", a.GetServiceAccountStatus)
+	registerGETWithPrefix(router, "/pricingSourceStatus", a.GetPricingSourceStatus)
+	registerGETWithPrefix(router, "/pricingSourceSummary", a.GetPricingSourceSummary)
+	registerGETWithPrefix(router, "/pricingSourceCounts", a.GetPricingSourceCounts)
+	registerGETWithPrefix(router, "/orphanedPods", a.GetOrphanedPods)
+	registerGETWithPrefix(router, "/installNamespace", a.GetInstallNamespace)
+	registerGETWithPrefix(router, "/installInfo", a.GetInstallInfo)
+	registerPOSTWithPrefix(router, "/serviceKey", adminAuthMiddleware(a.AddServiceKey))
+	registerGETWithPrefix(router, "/helmValues", a.GetHelmValues)
+}
+
+func registerCloudCostRoutes(router *httprouter.Router, cloudCostQueryService *cloudcost.QueryService, cloudCostPipelineService *cloudcost.PipelineService, cloudConfigController *cloudconfig.Controller) {
+	registerGETWithPrefix(router, "/cloudCost", cloudCostQueryService.GetCloudCostHandler())
+	registerGETWithPrefix(router, "/cloudCost/view/graph", cloudCostQueryService.GetCloudCostViewGraphHandler())
+	registerGETWithPrefix(router, "/cloudCost/view/totals", cloudCostQueryService.GetCloudCostViewTotalsHandler())
+	registerGETWithPrefix(router, "/cloudCost/view/table", cloudCostQueryService.GetCloudCostViewTableHandler(nil))
+
+	registerGETWithPrefix(router, "/cloudCost/status", cloudCostPipelineService.GetCloudCostStatusHandler())
+	registerGETWithPrefix(router, "/cloudCost/rebuild", adminAuthMiddleware(cloudCostPipelineService.GetCloudCostRebuildHandler()))
+	registerGETWithPrefix(router, "/cloudCost/repair", adminAuthMiddleware(cloudCostPipelineService.GetCloudCostRepairHandler()))
+	registerGETWithPrefix(router, "/cloud/config/export", adminAuthMiddleware(cloudConfigController.GetExportConfigHandler()))
+	registerGETWithPrefix(router, "/cloud/config/enable", adminAuthMiddleware(cloudConfigController.GetEnableConfigHandler()))
+	registerGETWithPrefix(router, "/cloud/config/disable", adminAuthMiddleware(cloudConfigController.GetDisableConfigHandler()))
+	registerGETWithPrefix(router, "/cloud/config/delete", adminAuthMiddleware(cloudConfigController.GetDeleteConfigHandler()))
+}
+
+func registerCustomCostRoutes(router *httprouter.Router, customCostQueryService *customcost.QueryService) {
+	registerGETWithPrefix(router, "/customCost/total", customCostQueryService.GetCustomCostTotalHandler())
+	registerGETWithPrefix(router, "/customCost/timeseries", customCostQueryService.GetCustomCostTimeseriesHandler())
 }
 
 // RefreshPricingData needs to be called when a new node joins the fleet, since we cache the relevant subsets of pricing data to avoid storing the whole thing.
+// RefreshPricingData refreshes pricing data from the configured cloud provider.
+// @Summary      刷新云定价缓存
+// @Tags         Pricing
+// @Description  触发一次云厂商定价数据重新下载与缓存刷新。
+// @Success      200  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /refreshPricing [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/refreshPricing [post]
 func (a *Accesses) RefreshPricingData(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -380,9 +397,22 @@ func (a *Accesses) RefreshPricingData(w http.ResponseWriter, r *http.Request, ps
 		log.Errorf("Error refreshing pricing data: %s", err.Error())
 	}
 
-	w.Write(WrapData(nil, err))
+	WriteData(w, nil, err)
 }
 
+// CostDataModel returns raw cost data records for a requested time window.
+// @Summary      查询原始成本数据模型
+// @Tags         Allocation
+// @Description  返回指定时间窗口内的原始成本数据记录，可按命名空间过滤，并可只返回指定字段。
+// @Param        timeWindow    query  string  true   "查询窗口时长，使用 duration 格式。示例：24h、7d"
+// @Param        offset        query  string  false  "相对当前时间的偏移量，使用 duration 格式。示例：24h"
+// @Param        filterFields  query  string  false  "仅返回指定字段，多个字段使用英文逗号分隔。"
+// @Param        namespace     query  string  false  "按命名空间过滤。"
+// @Success      200  {object}  costmodel.Response
+// @Failure      400  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /costDataModel [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/costDataModel [get]
 func (a *Accesses) CostDataModel(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -392,589 +422,295 @@ func (a *Accesses) CostDataModel(w http.ResponseWriter, r *http.Request, ps http
 	fields := r.URL.Query().Get("filterFields")
 	namespace := r.URL.Query().Get("namespace")
 
-	if offset != "" {
-		offset = "offset " + offset
+	duration, err := timeutil.ParseDuration(window)
+	if err != nil {
+		WriteData(w, nil, fmt.Errorf("error parsing window (%s): %s", window, err))
+		return
 	}
 
-	data, err := a.Model.ComputeCostData(a.PrometheusClient, a.CloudProvider, window, offset, namespace)
+	end := time.Now()
+	if offset != "" {
+		offsetDur, err := timeutil.ParseDuration(offset)
+		if err != nil {
+			WriteData(w, nil, fmt.Errorf("error parsing offset (%s): %s", offset, err))
+			return
+		}
+
+		end = end.Add(-offsetDur)
+	}
+
+	start := end.Add(-duration)
+
+	data, err := a.Model.ComputeCostData(start, end)
+
+	// apply filter by removing if != namespace
+	if namespace != "" {
+		for key, costData := range data {
+			if costData.Namespace != namespace {
+				delete(data, key)
+			}
+		}
+	}
 
 	if fields != "" {
 		filteredData := filterFields(fields, data)
-		w.Write(WrapData(filteredData, err))
+		WriteData(w, filteredData, err)
 	} else {
-		w.Write(WrapData(data, err))
-	}
-
-}
-
-func (a *Accesses) ClusterCosts(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	window := r.URL.Query().Get("window")
-	offset := r.URL.Query().Get("offset")
-
-	if window == "" {
-		w.Write(WrapData(nil, fmt.Errorf("missing window argument")))
-		return
-	}
-	windowDur, err := timeutil.ParseDuration(window)
-	if err != nil {
-		w.Write(WrapData(nil, fmt.Errorf("error parsing window (%s): %s", window, err)))
-		return
-	}
-
-	// offset is not a required parameter
-	var offsetDur time.Duration
-	if offset != "" {
-		offsetDur, err = timeutil.ParseDuration(offset)
-		if err != nil {
-			w.Write(WrapData(nil, fmt.Errorf("error parsing offset (%s): %s", offset, err)))
-			return
-		}
-	}
-
-	useThanos, _ := strconv.ParseBool(r.URL.Query().Get("multi"))
-
-	if useThanos && !thanos.IsEnabled() {
-		w.Write(WrapData(nil, fmt.Errorf("Multi=true while Thanos is not enabled.")))
-		return
-	}
-
-	var client prometheus.Client
-	if useThanos {
-		client = a.ThanosClient
-		offsetDur = thanos.OffsetDuration()
-
-	} else {
-		client = a.PrometheusClient
-	}
-
-	data, err := a.ComputeClusterCosts(client, a.CloudProvider, windowDur, offsetDur, true)
-	w.Write(WrapData(data, err))
-}
-
-func (a *Accesses) ClusterCostsOverTime(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	start := r.URL.Query().Get("start")
-	end := r.URL.Query().Get("end")
-	window := r.URL.Query().Get("window")
-	offset := r.URL.Query().Get("offset")
-
-	if window == "" {
-		w.Write(WrapData(nil, fmt.Errorf("missing window argument")))
-		return
-	}
-	windowDur, err := timeutil.ParseDuration(window)
-	if err != nil {
-		w.Write(WrapData(nil, fmt.Errorf("error parsing window (%s): %s", window, err)))
-		return
-	}
-
-	// offset is not a required parameter
-	var offsetDur time.Duration
-	if offset != "" {
-		offsetDur, err = timeutil.ParseDuration(offset)
-		if err != nil {
-			w.Write(WrapData(nil, fmt.Errorf("error parsing offset (%s): %s", offset, err)))
-			return
-		}
-	}
-
-	data, err := ClusterCostsOverTime(a.PrometheusClient, a.CloudProvider, start, end, windowDur, offsetDur)
-	w.Write(WrapData(data, err))
-}
-
-func (a *Accesses) CostDataModelRange(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	startStr := r.URL.Query().Get("start")
-	endStr := r.URL.Query().Get("end")
-	windowStr := r.URL.Query().Get("window")
-	fields := r.URL.Query().Get("filterFields")
-	namespace := r.URL.Query().Get("namespace")
-	cluster := r.URL.Query().Get("cluster")
-	remote := r.URL.Query().Get("remote")
-	remoteEnabled := env.IsRemoteEnabled() && remote != "false"
-
-	layout := "2006-01-02T15:04:05.000Z"
-	start, err := time.Parse(layout, startStr)
-	if err != nil {
-		w.Write(WrapDataWithMessage(nil, fmt.Errorf("invalid start date: %s", startStr), fmt.Sprintf("invalid start date: %s", startStr)))
-		return
-	}
-	end, err := time.Parse(layout, endStr)
-	if err != nil {
-		w.Write(WrapDataWithMessage(nil, fmt.Errorf("invalid end date: %s", endStr), fmt.Sprintf("invalid end date: %s", endStr)))
-		return
-	}
-
-	window := opencost.NewWindow(&start, &end)
-	if window.IsOpen() || !window.HasDuration() || window.IsNegative() {
-		w.Write(WrapDataWithMessage(nil, fmt.Errorf("invalid date range: %s", window), fmt.Sprintf("invalid date range: %s", window)))
-		return
-	}
-
-	resolution := time.Hour
-	if resDur, err := time.ParseDuration(windowStr); err == nil {
-		resolution = resDur
-	}
-
-	// Use Thanos Client if it exists (enabled) and remote flag set
-	var pClient prometheus.Client
-	if remote != "false" && a.ThanosClient != nil {
-		pClient = a.ThanosClient
-	} else {
-		pClient = a.PrometheusClient
-	}
-
-	data, err := a.Model.ComputeCostDataRange(pClient, a.CloudProvider, window, resolution, namespace, cluster, remoteEnabled)
-	if err != nil {
-		w.Write(WrapData(nil, err))
-	}
-	if fields != "" {
-		filteredData := filterFields(fields, data)
-		w.Write(WrapData(filteredData, err))
-	} else {
-		w.Write(WrapData(data, err))
+		WriteData(w, data, err)
 	}
 }
 
-func parseAggregations(customAggregation, aggregator, filterType string) (string, []string, string) {
-	var key string
-	var filter string
-	var val []string
-	if customAggregation != "" {
-		key = customAggregation
-		filter = filterType
-		val = strings.Split(customAggregation, ",")
-	} else {
-		aggregations := strings.Split(aggregator, ",")
-		for i, agg := range aggregations {
-			aggregations[i] = "kubernetes_" + agg
-		}
-		key = strings.Join(aggregations, ",")
-		filter = "kubernetes_" + filterType
-		val = aggregations
-	}
-	return key, val, filter
-}
-
+// GetAllNodePricing returns pricing data for all discovered node types.
+// @Summary      查询节点定价
+// @Tags         Pricing
+// @Description  返回当前云提供商下所有节点规格的定价信息。
+// @Success      200  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /allNodePricing [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/allNodePricing [get]
 func (a *Accesses) GetAllNodePricing(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	data, err := a.CloudProvider.AllNodePricing()
-	w.Write(WrapData(data, err))
+	WriteData(w, data, err)
 }
 
+// GetCustomPricing returns the active custom pricing configuration.
+// @Summary      查询自定义定价配置
+// @Tags         Pricing
+// @Description  返回当前生效的自定义定价配置内容。
+// @Success      200  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /customPricing [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/customPricing [get]
 func (a *Accesses) GetCustomPricing(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	data, err := a.CloudProvider.GetConfig()
-	w.Write(WrapData(data, err))
+	WriteData(w, data, err)
 }
 
+// GetCurrency returns the configured currency code from custom pricing.
+// @Summary      查询货币类型
+// @Tags         Pricing
+// @Description  返回当前配置的货币类型（如 $、€、¥ 等），从 customPricing 中提取。
+// @Success      200  {object}  map[string]string
+// @Failure      500  {object}  map[string]string
+// @Router       /currency [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/currency [get]
+func (a *Accesses) GetCurrency(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	config, err := a.CloudProvider.GetConfig()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	WriteData(w, map[string]string{"currencyCode": config.CurrencyCode}, nil)
+}
+
+func (a *Accesses) updateCloudConfig(w http.ResponseWriter, r *http.Request, updateType string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	data, err := a.CloudProvider.UpdateConfig(r.Body, updateType)
+	WriteData(w, data, err)
+	if err == nil {
+		err = a.CloudProvider.DownloadPricingData()
+		if err != nil {
+			log.Errorf("Error redownloading data on config update: %s", err.Error())
+		}
+	}
+}
+
+// UpdateSpotInfoConfigs updates spot pricing integration configuration.
+// @Summary      更新 Spot 配置
+// @Tags         Pricing
+// @Accept       json
+// @Description  使用请求体中的 JSON 更新 Spot 相关配置，并在成功后刷新定价数据。
+// @Success      200  {object}  costmodel.Response
+// @Failure      400  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /spotUpdate [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/spotUpdate [post]
 func (a *Accesses) UpdateSpotInfoConfigs(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	data, err := a.CloudProvider.UpdateConfig(r.Body, aws.SpotInfoUpdateType)
-	if err != nil {
-		w.Write(WrapData(data, err))
-		return
-	}
-	w.Write(WrapData(data, err))
-	err = a.CloudProvider.DownloadPricingData()
-	if err != nil {
-		log.Errorf("Error redownloading data on config update: %s", err.Error())
-	}
-	return
+	a.updateCloudConfig(w, r, "spotinfo")
 }
 
+// UpdateAthenaInfoConfigs updates Athena billing integration configuration.
+// @Summary      更新 Athena 配置
+// @Tags         Pricing
+// @Accept       json
+// @Description  使用请求体中的 JSON 更新 Athena 账单集成配置，并在成功后刷新定价数据。
+// @Success      200  {object}  costmodel.Response
+// @Failure      400  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /athenaUpdate [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/athenaUpdate [post]
 func (a *Accesses) UpdateAthenaInfoConfigs(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	data, err := a.CloudProvider.UpdateConfig(r.Body, aws.AthenaInfoUpdateType)
-	if err != nil {
-		w.Write(WrapData(data, err))
-		return
-	}
-	w.Write(WrapData(data, err))
-	return
+	a.updateCloudConfig(w, r, "athenainfo")
 }
 
+// UpdateBigQueryInfoConfigs updates BigQuery billing integration configuration.
+// @Summary      更新 BigQuery 配置
+// @Tags         Pricing
+// @Accept       json
+// @Description  使用请求体中的 JSON 更新 BigQuery 账单集成配置，并在成功后刷新定价数据。
+// @Success      200  {object}  costmodel.Response
+// @Failure      400  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /bigqueryUpdate [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/bigqueryUpdate [post]
 func (a *Accesses) UpdateBigQueryInfoConfigs(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	data, err := a.CloudProvider.UpdateConfig(r.Body, gcp.BigqueryUpdateType)
-	if err != nil {
-		w.Write(WrapData(data, err))
-		return
-	}
-	w.Write(WrapData(data, err))
-	return
+	a.updateCloudConfig(w, r, "bigqueryupdate")
 }
 
+// UpdateAzureStorageConfigs updates Azure storage billing integration configuration.
+// @Summary      更新 Azure Storage 配置
+// @Tags         Pricing
+// @Accept       json
+// @Description  使用请求体中的 JSON 更新 Azure Storage 账单集成配置，并在成功后刷新定价数据。
+// @Success      200  {object}  costmodel.Response
+// @Failure      400  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /azureStorageUpdate [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/azureStorageUpdate [post]
 func (a *Accesses) UpdateAzureStorageConfigs(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	data, err := a.CloudProvider.UpdateConfig(r.Body, azure.AzureStorageUpdateType)
-	if err != nil {
-		w.Write(WrapData(data, err))
-		return
-	}
-	w.Write(WrapData(data, err))
-	return
+	a.updateCloudConfig(w, r, "AzureStorage")
 }
 
+// UpdateConfigByKey updates cloud pricing configuration by key.
+// @Summary      按 Key 更新云配置
+// @Tags         Pricing
+// @Accept       json
+// @Description  使用请求体中的 JSON 更新指定云配置，并在成功后刷新定价数据。
+// @Success      200  {object}  costmodel.Response
+// @Failure      400  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /updateConfigByKey [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/updateConfigByKey [post]
 func (a *Accesses) UpdateConfigByKey(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	data, err := a.CloudProvider.UpdateConfig(r.Body, "")
-	if err != nil {
-		w.Write(WrapData(data, err))
-		return
-	}
-	w.Write(WrapData(data, err))
-	return
+	a.updateCloudConfig(w, r, "")
 }
 
+// ManagementPlatform returns the detected management platform metadata.
+// @Summary      查询管理平台信息
+// @Tags         Cluster
+// @Description  返回当前集群所处管理平台信息，例如托管平台类型。
+// @Success      200  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /managementPlatform [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/managementPlatform [get]
 func (a *Accesses) ManagementPlatform(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	data, err := a.CloudProvider.GetManagementPlatform()
-	if err != nil {
-		w.Write(WrapData(data, err))
-		return
-	}
-	w.Write(WrapData(data, err))
-	return
+	WriteData(w, data, err)
 }
 
+// ClusterInfo returns cluster metadata for the current cluster.
+// @Summary      查询集群信息
+// @Tags         Cluster
+// @Description  返回当前集群的基础元数据。
+// @Success      200  {object}  costmodel.Response
+// @Router       /clusterInfo [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/clusterInfo [get]
 func (a *Accesses) ClusterInfo(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	data := a.ClusterInfoProvider.GetClusterInfo()
 
-	w.Write(WrapData(data, nil))
+	WriteData(w, data, nil)
 }
 
+// GetClusterInfoMap returns the cluster map used by the cost model.
+// @Summary      查询集群映射表
+// @Tags         Cluster
+// @Description  返回集群 ID 到集群信息的映射表。
+// @Success      200  {object}  costmodel.Response
+// @Router       /clusterInfoMap [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/clusterInfoMap [get]
 func (a *Accesses) GetClusterInfoMap(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	data := a.ClusterMap.AsMap()
 
-	w.Write(WrapData(data, nil))
+	WriteData(w, data, nil)
 }
 
+// GetServiceAccountStatus returns cloud provider service account status.
+// @Summary      查询服务账号状态
+// @Tags         Pricing
+// @Description  返回云厂商访问凭据或服务账号的状态。
+// @Success      200  {object}  costmodel.Response
+// @Router       /serviceAccountStatus [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/serviceAccountStatus [get]
 func (a *Accesses) GetServiceAccountStatus(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	w.Write(WrapData(a.CloudProvider.ServiceAccountStatus(), nil))
+	WriteData(w, a.CloudProvider.ServiceAccountStatus(), nil)
 }
 
+// GetPricingSourceStatus returns current pricing source health information.
+// @Summary      查询定价源状态
+// @Tags         Pricing
+// @Description  返回当前启用定价源的状态信息。
+// @Success      200  {object}  costmodel.Response
+// @Router       /pricingSourceStatus [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/pricingSourceStatus [get]
 func (a *Accesses) GetPricingSourceStatus(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	w.Write(WrapData(a.CloudProvider.PricingSourceStatus(), nil))
+	data := a.CloudProvider.PricingSourceStatus()
+	WriteData(w, data, nil)
 }
 
+// GetPricingSourceCounts returns counts of pricing records by source.
+// @Summary      查询定价源数量统计
+// @Tags         Pricing
+// @Description  返回不同定价源的记录数量统计。
+// @Success      200  {object}  costmodel.Response
+// @Failure      500  {object}  costmodel.Response
+// @Router       /pricingSourceCounts [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/pricingSourceCounts [get]
 func (a *Accesses) GetPricingSourceCounts(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	w.Write(WrapData(a.Model.GetPricingSourceCounts()))
+	data, err := a.Model.GetPricingSourceCounts()
+	WriteData(w, data, err)
 }
 
+// GetPricingSourceSummary returns a human-readable pricing source summary.
+// @Summary      查询定价源摘要
+// @Tags         Pricing
+// @Description  返回当前定价源的汇总说明信息。
+// @Success      200  {object}  costmodel.Response
+// @Router       /pricingSourceSummary [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/pricingSourceSummary [get]
 func (a *Accesses) GetPricingSourceSummary(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	data := a.CloudProvider.PricingSourceSummary()
-	w.Write(WrapData(data, nil))
+	WriteData(w, data, nil)
 }
 
-func (a *Accesses) GetPrometheusMetadata(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	w.Write(WrapData(prom.Validate(a.PrometheusClient)))
-}
-
-func (a *Accesses) PrometheusQuery(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	qp := httputil.NewQueryParams(r.URL.Query())
-	query := qp.Get("query", "")
-	if query == "" {
-		w.Write(WrapData(nil, fmt.Errorf("Query Parameter 'query' is unset'")))
-		return
-	}
-
-	// Attempt to parse time as either a unix timestamp or as an RFC3339 value
-	var timeVal time.Time
-	timeStr := qp.Get("time", "")
-	if len(timeStr) > 0 {
-		if t, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
-			timeVal = time.Unix(t, 0)
-		} else if t, err := time.Parse(time.RFC3339, timeStr); err == nil {
-			timeVal = t
-		}
-
-		// If time is given, but not parse-able, return an error
-		if timeVal.IsZero() {
-			http.Error(w, fmt.Sprintf("time must be a unix timestamp or RFC3339 value; illegal value given: %s", timeStr), http.StatusBadRequest)
-		}
-	}
-
-	ctx := prom.NewNamedContext(a.PrometheusClient, prom.FrontendContextName)
-	body, err := ctx.RawQuery(query, timeVal)
-	if err != nil {
-		w.Write(WrapData(nil, fmt.Errorf("Error running query %s. Error: %s", query, err)))
-		return
-	}
-
-	w.Write(body)
-}
-
-func (a *Accesses) PrometheusQueryRange(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	qp := httputil.NewQueryParams(r.URL.Query())
-	query := qp.Get("query", "")
-	if query == "" {
-		fmt.Fprintf(w, "Error parsing query from request parameters.")
-		return
-	}
-
-	start, end, duration, err := toStartEndStep(qp)
-	if err != nil {
-		fmt.Fprintf(w, err.Error())
-		return
-	}
-
-	ctx := prom.NewNamedContext(a.PrometheusClient, prom.FrontendContextName)
-	body, err := ctx.RawQueryRange(query, start, end, duration)
-	if err != nil {
-		fmt.Fprintf(w, "Error running query %s. Error: %s", query, err)
-		return
-	}
-
-	w.Write(body)
-}
-
-func (a *Accesses) ThanosQuery(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if !thanos.IsEnabled() {
-		w.Write(WrapData(nil, fmt.Errorf("ThanosDisabled")))
-		return
-	}
-
-	qp := httputil.NewQueryParams(r.URL.Query())
-	query := qp.Get("query", "")
-	if query == "" {
-		w.Write(WrapData(nil, fmt.Errorf("Query Parameter 'query' is unset'")))
-		return
-	}
-
-	// Attempt to parse time as either a unix timestamp or as an RFC3339 value
-	var timeVal time.Time
-	timeStr := qp.Get("time", "")
-	if len(timeStr) > 0 {
-		if t, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
-			timeVal = time.Unix(t, 0)
-		} else if t, err := time.Parse(time.RFC3339, timeStr); err == nil {
-			timeVal = t
-		}
-
-		// If time is given, but not parse-able, return an error
-		if timeVal.IsZero() {
-			http.Error(w, fmt.Sprintf("time must be a unix timestamp or RFC3339 value; illegal value given: %s", timeStr), http.StatusBadRequest)
-		}
-	}
-
-	ctx := prom.NewNamedContext(a.ThanosClient, prom.FrontendContextName)
-	body, err := ctx.RawQuery(query, timeVal)
-	if err != nil {
-		w.Write(WrapData(nil, fmt.Errorf("Error running query %s. Error: %s", query, err)))
-		return
-	}
-
-	w.Write(body)
-}
-
-func (a *Accesses) ThanosQueryRange(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if !thanos.IsEnabled() {
-		w.Write(WrapData(nil, fmt.Errorf("ThanosDisabled")))
-		return
-	}
-
-	qp := httputil.NewQueryParams(r.URL.Query())
-	query := qp.Get("query", "")
-	if query == "" {
-		fmt.Fprintf(w, "Error parsing query from request parameters.")
-		return
-	}
-
-	start, end, duration, err := toStartEndStep(qp)
-	if err != nil {
-		fmt.Fprintf(w, err.Error())
-		return
-	}
-
-	ctx := prom.NewNamedContext(a.ThanosClient, prom.FrontendContextName)
-	body, err := ctx.RawQueryRange(query, start, end, duration)
-	if err != nil {
-		fmt.Fprintf(w, "Error running query %s. Error: %s", query, err)
-		return
-	}
-
-	w.Write(body)
-}
-
-// helper for query range proxy requests
-func toStartEndStep(qp httputil.QueryParams) (start, end time.Time, step time.Duration, err error) {
-	var e error
-
-	ss := qp.Get("start", "")
-	es := qp.Get("end", "")
-	ds := qp.Get("duration", "")
-	layout := "2006-01-02T15:04:05.000Z"
-
-	start, e = time.Parse(layout, ss)
-	if e != nil {
-		err = fmt.Errorf("Error parsing time %s. Error: %s", ss, err)
-		return
-	}
-	end, e = time.Parse(layout, es)
-	if e != nil {
-		err = fmt.Errorf("Error parsing time %s. Error: %s", es, err)
-		return
-	}
-	step, e = time.ParseDuration(ds)
-	if e != nil {
-		err = fmt.Errorf("Error parsing duration %s. Error: %s", ds, err)
-		return
-	}
-	err = nil
-
-	return
-}
-
-func (a *Accesses) GetPrometheusQueueState(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	promQueueState, err := prom.GetPrometheusQueueState(a.PrometheusClient)
-	if err != nil {
-		w.Write(WrapData(nil, err))
-		return
-	}
-
-	result := map[string]*prom.PrometheusQueueState{
-		"prometheus": promQueueState,
-	}
-
-	if thanos.IsEnabled() {
-		thanosQueueState, err := prom.GetPrometheusQueueState(a.ThanosClient)
-		if err != nil {
-			log.Warnf("Error getting Thanos queue state: %s", err)
-		} else {
-			result["thanos"] = thanosQueueState
-		}
-	}
-
-	w.Write(WrapData(result, nil))
-}
-
-// GetPrometheusMetrics retrieves availability of Prometheus and Thanos metrics
-func (a *Accesses) GetPrometheusMetrics(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	promMetrics := prom.GetPrometheusMetrics(a.PrometheusClient, "")
-
-	result := map[string][]*prom.PrometheusDiagnostic{
-		"prometheus": promMetrics,
-	}
-
-	if thanos.IsEnabled() {
-		thanosMetrics := prom.GetPrometheusMetrics(a.ThanosClient, thanos.QueryOffset())
-		result["thanos"] = thanosMetrics
-	}
-
-	w.Write(WrapData(result, nil))
-}
-
-func (a *Accesses) PrometheusRecordingRules(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	u := a.PrometheusClient.URL(epRules, nil)
-
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-	if err != nil {
-		fmt.Fprintf(w, "Error creating Prometheus rule request: "+err.Error())
-	}
-
-	_, body, err := a.PrometheusClient.Do(r.Context(), req)
-	if err != nil {
-		fmt.Fprintf(w, "Error making Prometheus rule request: "+err.Error())
-	} else {
-		w.Write(body)
-	}
-}
-
-func (a *Accesses) PrometheusConfig(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	pConfig := map[string]string{
-		"address": env.GetPrometheusServerEndpoint(),
-	}
-
-	body, err := json.Marshal(pConfig)
-	if err != nil {
-		fmt.Fprintf(w, "Error marshalling prometheus config")
-	} else {
-		w.Write(body)
-	}
-}
-
-func (a *Accesses) PrometheusTargets(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	u := a.PrometheusClient.URL(epTargets, nil)
-
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-	if err != nil {
-		fmt.Fprintf(w, "Error creating Prometheus rule request: "+err.Error())
-	}
-
-	_, body, err := a.PrometheusClient.Do(r.Context(), req)
-	if err != nil {
-		fmt.Fprintf(w, "Error making Prometheus rule request: "+err.Error())
-	} else {
-		w.Write(body)
-	}
-}
-
+// GetOrphanedPods returns pods without owner references.
+// @Summary      查询孤儿 Pod
+// @Tags         Cluster
+// @Description  返回当前集群中没有 OwnerReference 的 Pod 列表。
+// @Success      200  {object}  array
+// @Failure      500  {object}  costmodel.Response
+// @Router       /orphanedPods [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/orphanedPods [get]
 func (a *Accesses) GetOrphanedPods(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -990,17 +726,24 @@ func (a *Accesses) GetOrphanedPods(w http.ResponseWriter, r *http.Request, ps ht
 
 	body, err := json.Marshal(lonePods)
 	if err != nil {
-		fmt.Fprintf(w, "Error decoding pod: "+err.Error())
+		fmt.Fprintf(w, "Error decoding pod: %s", err)
 	} else {
 		w.Write(body)
 	}
 }
 
+// GetInstallNamespace returns the namespace where OpenCost is installed.
+// @Summary      查询安装命名空间
+// @Tags         Cluster
+// @Description  返回当前 OpenCost 部署所在的 Kubernetes namespace。
+// @Success      200  {string}  string
+// @Router       /installNamespace [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/installNamespace [get]
 func (a *Accesses) GetInstallNamespace(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	ns := env.GetKubecostNamespace()
+	ns := env.GetOpencostNamespace()
 	w.Write([]byte(ns))
 }
 
@@ -1016,13 +759,21 @@ type ContainerInfo struct {
 	StartTime     string `json:"startTime"`
 }
 
+// GetInstallInfo returns runtime and deployment metadata for the current OpenCost installation.
+// @Summary      查询安装信息
+// @Tags         Cluster
+// @Description  返回 OpenCost 组件镜像、启动时间、版本以及集群规模信息。
+// @Success      200  {object}  costmodel.InstallInfo
+// @Failure      500  {object}  costmodel.Response
+// @Router       /installInfo [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/installInfo [get]
 func (a *Accesses) GetInstallInfo(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	containers, err := GetKubecostContainers(a.KubeClientSet)
 	if err != nil {
-		writeErrorResponse(w, 500, fmt.Sprintf("Unable to list pods: %s", err.Error()))
+		http.Error(w, fmt.Sprintf("Unable to list pods: %s", err.Error()), http.StatusInternalServerError)
 		return
 	}
 
@@ -1040,7 +791,7 @@ func (a *Accesses) GetInstallInfo(w http.ResponseWriter, r *http.Request, _ http
 
 	body, err := json.Marshal(info)
 	if err != nil {
-		writeErrorResponse(w, 500, fmt.Sprintf("Error decoding pod: %s", err.Error()))
+		http.Error(w, fmt.Sprintf("Error decoding pod: %s", err.Error()), http.StatusInternalServerError)
 		return
 	}
 
@@ -1048,7 +799,7 @@ func (a *Accesses) GetInstallInfo(w http.ResponseWriter, r *http.Request, _ http
 }
 
 func GetKubecostContainers(kubeClientSet kubernetes.Interface) ([]ContainerInfo, error) {
-	pods, err := kubeClientSet.CoreV1().Pods(env.GetKubecostNamespace()).List(context.Background(), metav1.ListOptions{
+	pods, err := kubeClientSet.CoreV1().Pods(env.GetOpencostNamespace()).List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=cost-analyzer",
 		FieldSelector: "status.phase=Running",
 		Limit:         1,
@@ -1059,7 +810,7 @@ func GetKubecostContainers(kubeClientSet kubernetes.Interface) ([]ContainerInfo,
 
 	// If we have zero pods either something is weird with the install since the app selector is not exposed in the helm
 	// chart or more likely we are running locally - in either case Images field will return as null
-	var containers []ContainerInfo
+	containers := make([]ContainerInfo, 0)
 	if len(pods.Items) > 0 {
 		for _, pod := range pods.Items {
 			for _, container := range pod.Spec.Containers {
@@ -1076,6 +827,16 @@ func GetKubecostContainers(kubeClientSet kubernetes.Interface) ([]ContainerInfo,
 	return containers, nil
 }
 
+// AddServiceKey writes a GCP service account key to the configured secret path.
+// @Summary      上传服务账号密钥
+// @Tags         Pricing
+// @Accept       application/x-www-form-urlencoded
+// @Description  写入 GCP 服务账号密钥文件。该接口通常受管理员鉴权保护。
+// @Param        key  formData  string  true  "GCP service account key JSON"
+// @Success      200  {string}  string
+// @Failure      500  {string}  string
+// @Router       /serviceKey [post]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/serviceKey [post]
 func (a *Accesses) AddServiceKey(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1084,14 +845,22 @@ func (a *Accesses) AddServiceKey(w http.ResponseWriter, r *http.Request, ps http
 
 	key := r.PostForm.Get("key")
 	k := []byte(key)
-	err := os.WriteFile(path.Join(env.GetConfigPathWithDefault(env.DefaultConfigMountPath), "key.json"), k, 0644)
+	err := os.WriteFile(env.GetGCPAuthSecretFilePath(), k, 0644)
 	if err != nil {
-		fmt.Fprintf(w, "Error writing service key: "+err.Error())
+		fmt.Fprintf(w, "Error writing service key: %s", err)
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
+// GetHelmValues returns the Helm values used for the current installation when enabled.
+// @Summary      查询 Helm Values
+// @Tags         Cluster
+// @Description  返回当前部署的 Helm values；如果未开启暴露则返回提示信息。
+// @Success      200  {string}  string
+// @Failure      500  {string}  string
+// @Router       /helmValues [get]
+// @Router       /kapis/costwise.wiztelemetry.io/v1alpha1/helmValues [get]
 func (a *Accesses) GetHelmValues(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1111,136 +880,8 @@ func (a *Accesses) GetHelmValues(w http.ResponseWriter, r *http.Request, ps http
 	w.Write(result)
 }
 
-func (a *Accesses) Status(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	promServer := env.GetPrometheusServerEndpoint()
-
-	api := prometheusAPI.NewAPI(a.PrometheusClient)
-	result, err := api.Buildinfo(r.Context())
-	if err != nil {
-		fmt.Fprintf(w, "Using Prometheus at "+promServer+". Error: "+err.Error())
-	} else {
-
-		fmt.Fprintf(w, "Using Prometheus at "+promServer+". Version: "+result.Version)
-	}
-}
-
-// captures the panic event in sentry
-func capturePanicEvent(err string, stack string) {
-	msg := fmt.Sprintf("Panic: %s\nStackTrace: %s\n", err, stack)
-	log.Infof(msg)
-	sentry.CurrentHub().CaptureEvent(&sentry.Event{
-		Level:   sentry.LevelError,
-		Message: msg,
-	})
-	sentry.Flush(5 * time.Second)
-}
-
-// handle any panics reported by the errors package
-func handlePanic(p errors.Panic) bool {
-	err := p.Error
-
-	if err != nil {
-		if err, ok := err.(error); ok {
-			capturePanicEvent(err.Error(), p.Stack)
-		}
-
-		if err, ok := err.(string); ok {
-			capturePanicEvent(err, p.Stack)
-		}
-	}
-
-	// Return true to recover iff the type is http, otherwise allow kubernetes
-	// to recover.
-	return p.Type == errors.PanicTypeHTTP
-}
-
 func Initialize(router *httprouter.Router, additionalConfigWatchers ...*watcher.ConfigMapWatcher) *Accesses {
 	var err error
-	if errorReportingEnabled {
-		err = sentry.Init(sentry.ClientOptions{Release: version.FriendlyVersion()})
-		if err != nil {
-			log.Infof("Failed to initialize sentry for error reporting")
-		} else {
-			err = errors.SetPanicHandler(handlePanic)
-			if err != nil {
-				log.Infof("Failed to set panic handler: %s", err)
-			}
-		}
-	}
-
-	address := env.GetPrometheusServerEndpoint()
-	if address == "" {
-		log.Fatalf("No address for prometheus set in $%s. Aborting.", env.PrometheusServerEndpointEnvVar)
-	}
-
-	queryConcurrency := env.GetMaxQueryConcurrency()
-	log.Infof("Prometheus/Thanos Client Max Concurrency set to %d", queryConcurrency)
-
-	timeout := 120 * time.Second
-	keepAlive := 120 * time.Second
-	tlsHandshakeTimeout := 10 * time.Second
-	scrapeInterval := env.GetKubecostScrapeInterval()
-
-	var rateLimitRetryOpts *prom.RateLimitRetryOpts = nil
-	if env.IsPrometheusRetryOnRateLimitResponse() {
-		rateLimitRetryOpts = &prom.RateLimitRetryOpts{
-			MaxRetries:       env.GetPrometheusRetryOnRateLimitMaxRetries(),
-			DefaultRetryWait: env.GetPrometheusRetryOnRateLimitDefaultWait(),
-		}
-	}
-
-	promCli, err := prom.NewPrometheusClient(address, &prom.PrometheusClientConfig{
-		Timeout:               timeout,
-		KeepAlive:             keepAlive,
-		TLSHandshakeTimeout:   tlsHandshakeTimeout,
-		TLSInsecureSkipVerify: env.GetInsecureSkipVerify(),
-		RateLimitRetryOpts:    rateLimitRetryOpts,
-		Auth: &prom.ClientAuth{
-			Username:    env.GetDBBasicAuthUsername(),
-			Password:    env.GetDBBasicAuthUserPassword(),
-			BearerToken: env.GetDBBearerToken(),
-		},
-		QueryConcurrency:  queryConcurrency,
-		QueryLogFile:      "",
-		HeaderXScopeOrgId: env.GetPrometheusHeaderXScopeOrgId(),
-	})
-	if err != nil {
-		log.Fatalf("Failed to create prometheus client, Error: %v", err)
-	}
-
-	m, err := prom.Validate(promCli)
-	if err != nil || !m.Running {
-		if err != nil {
-			log.Errorf("Failed to query prometheus at %s. Error: %s . Troubleshooting help available at: %s", address, err.Error(), prom.PrometheusTroubleshootingURL)
-		} else if !m.Running {
-			log.Errorf("Prometheus at %s is not running. Troubleshooting help available at: %s", address, prom.PrometheusTroubleshootingURL)
-		}
-	} else {
-		log.Infof("Success: retrieved the 'up' query against prometheus at: " + address)
-	}
-
-	api := prometheusAPI.NewAPI(promCli)
-	result, err := api.Buildinfo(context.Background())
-	if err != nil {
-		log.Infof("No valid prometheus config file at %s. Error: %s . Troubleshooting help available at: %s. Ignore if using cortex/mimir/thanos here.", address, err.Error(), prom.PrometheusTroubleshootingURL)
-	} else {
-		log.Infof("Retrieved a prometheus config file from: %s", address)
-		prometheusVersion = result.Version
-	}
-
-	if scrapeInterval == 0 {
-		scrapeInterval = time.Minute
-		// Lookup scrape interval for kubecost job, update if found
-		si, err := prom.ScrapeIntervalFor(promCli, env.GetKubecostJobName())
-		if err == nil {
-			scrapeInterval = si
-		}
-	}
-
-	log.Infof("Using scrape interval of %f", scrapeInterval.Seconds())
 
 	// Kubernetes API setup
 	kubeClientset, err := kubeconfig.LoadKubeClient("")
@@ -1248,17 +889,17 @@ func Initialize(router *httprouter.Router, additionalConfigWatchers ...*watcher.
 		log.Fatalf("Failed to build Kubernetes client: %s", err.Error())
 	}
 
-	// Create ConfigFileManager for synchronization of shared configuration
-	confManager := config.NewConfigFileManager(&config.ConfigFileManagerOpts{
-		BucketStoreConfig: env.GetKubecostConfigBucket(),
-		LocalConfigPath:   "/",
-	})
-
-	configPrefix := env.GetConfigPathWithDefault("/var/configs/")
+	clusterUID, err := kubeconfig.GetClusterUID(kubeClientset)
+	if err != nil {
+		log.Fatalf("Failed to determine cluster UID: %s", err)
+	}
 
 	// Create Kubernetes Cluster Cache + Watchers
-	k8sCache := clustercache.NewKubernetesClusterCache(kubeClientset)
+	k8sCache := clusterc.NewKubernetesClusterCache(kubeClientset)
 	k8sCache.Run()
+
+	// Create ConfigFileManager for synchronization of shared configuration
+	confManager := config.NewConfigFileManager(nil)
 
 	cloudProviderKey := env.GetCloudProviderAPIKey()
 	cloudProvider, err := provider.NewProvider(k8sCache, cloudProviderKey, confManager)
@@ -1266,112 +907,84 @@ func Initialize(router *httprouter.Router, additionalConfigWatchers ...*watcher.
 		panic(err.Error())
 	}
 
-	// Append the pricing config watcher
-	kubecostNamespace := env.GetKubecostNamespace()
-
-	configWatchers := watcher.NewConfigMapWatchers(kubeClientset, kubecostNamespace, additionalConfigWatchers...)
-	configWatchers.AddWatcher(provider.ConfigWatcherFor(cloudProvider))
-	configWatchers.AddWatcher(metrics.GetMetricsConfigWatcher())
-	configWatchers.Watch()
-
-	remoteEnabled := env.IsRemoteEnabled()
-	if remoteEnabled {
-		info, err := cloudProvider.ClusterInfo()
-		log.Infof("Saving cluster  with id:'%s', and name:'%s' to durable storage", info["id"], info["name"])
-		if err != nil {
-			log.Infof("Error saving cluster id %s", err.Error())
-		}
-		_, _, err = utils.GetOrCreateClusterMeta(info["id"], info["name"])
-		if err != nil {
-			log.Infof("Unable to set cluster id '%s' for cluster '%s', %s", info["id"], info["name"], err.Error())
-		}
-	}
-
-	// Thanos Client
-	var thanosClient prometheus.Client
-	if thanos.IsEnabled() {
-		thanosAddress := thanos.QueryURL()
-
-		if thanosAddress != "" {
-			thanosCli, _ := thanos.NewThanosClient(thanosAddress, &prom.PrometheusClientConfig{
-				Timeout:               timeout,
-				KeepAlive:             keepAlive,
-				TLSHandshakeTimeout:   tlsHandshakeTimeout,
-				TLSInsecureSkipVerify: env.GetInsecureSkipVerify(),
-				RateLimitRetryOpts:    rateLimitRetryOpts,
-				Auth: &prom.ClientAuth{
-					Username:    env.GetMultiClusterBasicAuthUsername(),
-					Password:    env.GetMultiClusterBasicAuthPassword(),
-					BearerToken: env.GetMultiClusterBearerToken(),
-				},
-				QueryConcurrency: queryConcurrency,
-				QueryLogFile:     env.GetQueryLoggingFile(),
-			})
-
-			_, err = prom.Validate(thanosCli)
-			if err != nil {
-				log.Warnf("Failed to query Thanos at %s. Error: %s.", thanosAddress, err.Error())
-				thanosClient = thanosCli
-			} else {
-				log.Infof("Success: retrieved the 'up' query against Thanos at: " + thanosAddress)
-
-				thanosClient = thanosCli
-			}
-
-		} else {
-			log.Infof("Error resolving environment variable: $%s", env.ThanosQueryUrlEnvVar)
-		}
-	}
-
 	// ClusterInfo Provider to provide the cluster map with local and remote cluster data
 	var clusterInfoProvider clusters.ClusterInfoProvider
 	if env.IsClusterInfoFileEnabled() {
-		clusterInfoFile := confManager.ConfigFileAt(path.Join(configPrefix, "cluster-info.json"))
+		clusterInfoFile := confManager.ConfigFileAt(env.GetClusterInfoFilePath())
 		clusterInfoProvider = NewConfiguredClusterInfoProvider(clusterInfoFile)
 	} else {
 		clusterInfoProvider = NewLocalClusterInfoProvider(kubeClientset, cloudProvider)
 	}
 
-	// Initialize ClusterMap for maintaining ClusterInfo by ClusterID
-	var clusterMap clusters.ClusterMap
-	if thanosClient != nil {
-		clusterMap = clustermap.NewClusterMap(thanosClient, clusterInfoProvider, 10*time.Minute)
-	} else {
-		clusterMap = clustermap.NewClusterMap(promCli, clusterInfoProvider, 5*time.Minute)
+	const maxRetries = 10
+	const retryInterval = 10 * time.Second
+
+	var fatalErr error
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fn := func() (source.OpenCostDataSource, error) {
+		ds, e := prom.NewDefaultPrometheusDataSource(clusterInfoProvider)
+		if e != nil {
+			if source.IsRetryable(e) {
+				return nil, e
+			}
+			fatalErr = e
+			cancel()
+		}
+
+		return ds, e
+	}
+	if env.IsCollectorDataSourceEnabled() {
+		fn = func() (source.OpenCostDataSource, error) {
+			store := GetDefaultCollectorStorage()
+			nodeStatConf, err := NewNodeClientConfigFromEnv()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get node client config: %w", err)
+			}
+			clusterConfig, err := kubeconfig.LoadKubeconfig("")
+			if err != nil {
+				return nil, fmt.Errorf("failed to load kube config: %w", err)
+			}
+			nodeStatClient := nodestats.NewNodeStatsSummaryClient(k8sCache, nodeStatConf, clusterConfig)
+			ds := collector.NewDefaultCollectorDataSource(
+				clusterUID,
+				store,
+				clusterInfoProvider,
+				k8sCache,
+				nodeStatClient,
+			)
+			return ds, nil
+		}
 	}
 
-	// cache responses from model and aggregation for a default of 10 minutes;
-	// clear expired responses every 20 minutes
-	aggregateCache := cache.New(time.Minute*10, time.Minute*20)
-	costDataCache := cache.New(time.Minute*10, time.Minute*20)
-	clusterCostsCache := cache.New(cache.NoExpiration, cache.NoExpiration)
-	outOfClusterCache := cache.New(time.Minute*5, time.Minute*10)
+	dataSource, _ := retry.Retry(
+		ctx,
+		fn,
+		maxRetries,
+		retryInterval,
+	)
+
+	if fatalErr != nil {
+		log.Fatalf("Failed to create Prometheus data source: %s", fatalErr)
+		panic(fatalErr)
+	}
+
+	// Append the pricing config watcher
+	installNamespace := env.GetOpencostNamespace()
+
+	configWatchers := watcher.NewConfigMapWatchers(kubeClientset, installNamespace, additionalConfigWatchers...)
+	configWatchers.AddWatcher(provider.ConfigWatcherFor(cloudProvider))
+	configWatchers.AddWatcher(metrics.GetMetricsConfigWatcher())
+	configWatchers.Watch()
+
+	clusterMap := dataSource.ClusterMap()
 	settingsCache := cache.New(cache.NoExpiration, cache.NoExpiration)
 
-	// query durations that should be cached longer should be registered here
-	// use relatively prime numbers to minimize likelihood of synchronized
-	// attempts at cache warming
-	day := 24 * time.Hour
-	cacheExpiration := map[time.Duration]time.Duration{
-		day:      maxCacheMinutes1d * time.Minute,
-		2 * day:  maxCacheMinutes2d * time.Minute,
-		7 * day:  maxCacheMinutes7d * time.Minute,
-		30 * day: maxCacheMinutes30d * time.Minute,
-	}
-
-	var pc prometheus.Client
-	if thanosClient != nil {
-		pc = thanosClient
-	} else {
-		pc = promCli
-	}
-	costModel := NewCostModel(pc, cloudProvider, k8sCache, clusterMap, scrapeInterval)
-	metricsEmitter := NewCostModelMetricsEmitter(promCli, k8sCache, cloudProvider, clusterInfoProvider, costModel)
+	costModel := NewCostModel(clusterUID, dataSource, cloudProvider, k8sCache, clusterMap, dataSource.BatchDuration())
+	metricsEmitter := NewCostModelMetricsEmitter(k8sCache, cloudProvider, clusterInfoProvider, costModel)
 
 	a := &Accesses{
-		httpServices:        services.NewCostModelServices(),
-		PrometheusClient:    promCli,
-		ThanosClient:        thanosClient,
+		DataSource:          dataSource,
 		KubeClientSet:       kubeClientset,
 		ClusterCache:        k8sCache,
 		ClusterMap:          clusterMap,
@@ -1380,108 +993,73 @@ func Initialize(router *httprouter.Router, additionalConfigWatchers ...*watcher.
 		ClusterInfoProvider: clusterInfoProvider,
 		Model:               costModel,
 		MetricsEmitter:      metricsEmitter,
-		AggregateCache:      aggregateCache,
-		CostDataCache:       costDataCache,
-		ClusterCostsCache:   clusterCostsCache,
-		OutOfClusterCache:   outOfClusterCache,
 		SettingsCache:       settingsCache,
-		CacheExpiration:     cacheExpiration,
+		QueryCache:          newQueryCache(),
 	}
-
-	// Use the Accesses instance, itself, as the CostModelAggregator. This is
-	// confusing and unconventional, but necessary so that we can swap it
-	// out for the ETL-adapted version elsewhere.
-	// TODO clean this up once ETL is open-sourced.
-	a.AggAPI = a
 
 	// Initialize mechanism for subscribing to settings changes
 	a.InitializeSettingsPubSub()
 	err = a.CloudProvider.DownloadPricingData()
 	if err != nil {
-		log.Infof("Failed to download pricing data: " + err.Error())
-	}
-
-	// Warm the aggregate cache unless explicitly set to false
-	if env.IsCacheWarmingEnabled() {
-		log.Infof("Init: AggregateCostModel cache warming enabled")
-		a.warmAggregateCostModelCache()
-	} else {
-		log.Infof("Init: AggregateCostModel cache warming disabled")
+		log.Infof("Failed to download pricing data: %s", err)
 	}
 
 	if !env.IsKubecostMetricsPodEnabled() {
 		a.MetricsEmitter.Start()
 	}
 
-	a.httpServices.RegisterAll(router)
+	a.DataSource.RegisterEndPoints(RoutePrefix, router)
 
-	router.GET("/costDataModel", a.CostDataModel)
-	router.GET("/costDataModelRange", a.CostDataModelRange)
-	router.GET("/aggregatedCostModel", a.AggregateCostModelHandler)
-	router.GET("/allocation/compute", a.ComputeAllocationHandler)
-	router.GET("/allocation/compute/summary", a.ComputeAllocationHandlerSummary)
-	router.GET("/allNodePricing", a.GetAllNodePricing)
-	router.GET("/customPricing", a.GetCustomPricing)
-	router.POST("/refreshPricing", a.RefreshPricingData)
-	router.GET("/clusterCostsOverTime", a.ClusterCostsOverTime)
-	router.GET("/clusterCosts", a.ClusterCosts)
-	router.GET("/clusterCostsFromCache", a.ClusterCostsFromCacheHandler)
-	router.GET("/validatePrometheus", a.GetPrometheusMetadata)
-	router.GET("/managementPlatform", a.ManagementPlatform)
-	router.GET("/clusterInfo", a.ClusterInfo)
-	router.GET("/clusterInfoMap", a.GetClusterInfoMap)
-	router.GET("/serviceAccountStatus", a.GetServiceAccountStatus)
-	router.GET("/pricingSourceStatus", a.GetPricingSourceStatus)
-	router.GET("/pricingSourceSummary", a.GetPricingSourceSummary)
-	router.GET("/pricingSourceCounts", a.GetPricingSourceCounts)
-
-	// endpoints migrated from server
-	router.GET("/prometheusRecordingRules", a.PrometheusRecordingRules)
-	router.GET("/prometheusConfig", a.PrometheusConfig)
-	router.GET("/prometheusTargets", a.PrometheusTargets)
-	router.GET("/orphanedPods", a.GetOrphanedPods)
-	router.GET("/installNamespace", a.GetInstallNamespace)
-	router.GET("/installInfo", a.GetInstallInfo)
-	router.POST("/serviceKey", a.AddServiceKey)
-	router.GET("/helmValues", a.GetHelmValues)
-	router.GET("/status", a.Status)
-
-	// prom query proxies
-	router.GET("/prometheusQuery", a.PrometheusQuery)
-	router.GET("/prometheusQueryRange", a.PrometheusQueryRange)
-	router.GET("/thanosQuery", a.ThanosQuery)
-	router.GET("/thanosQueryRange", a.ThanosQueryRange)
-
-	// diagnostics
-	router.GET("/diagnostics/requestQueue", a.GetPrometheusQueueState)
-	router.GET("/diagnostics/prometheusMetrics", a.GetPrometheusMetrics)
+	registerAccessesRoutes(router, a)
 
 	return a
 }
 
+// GetDefaultStorage retrieves the default shared storage which is required for running an opencost collector.
+func GetDefaultCollectorStorage() storage.Storage {
+	const warningMessage = `Failed to create local collector directory '%s' - %s.
+		Did you mean to enable to collector? For persistent storage, it's recommended to use Prometheus, 
+		or set a storage bucket configuration at %s. 
+
+		%s`
+
+	// Try bucket storage if it exists
+	store, err := storage.TryGetDefaultStorage()
+	if err == nil {
+		return store
+	}
+
+	// Fallback to a local storage bucket
+	dir := env.GetLocalCollectorDirectory()
+	err = os.MkdirAll(dir, os.ModePerm)
+	if err != nil {
+		log.Warnf(
+			warningMessage,
+			dir,
+			err.Error(),
+			sysenv.GetDefaultStorageConfigFilePath(),
+			"Falling back to an in-memory file system for collector, which will lose any persistent storage upon restart.",
+		)
+
+		return storage.NewMemoryStorage()
+	}
+
+	return storage.NewFileStorage(dir)
+}
+
 // InitializeCloudCost Initializes Cloud Cost pipeline and querier and registers endpoints
-func InitializeCloudCost(router *httprouter.Router, providerConfig models.ProviderConfig) {
+func InitializeCloudCost(router *httprouter.Router) *cloudcost.PipelineService {
 	log.Debugf("Cloud Cost config path: %s", env.GetCloudCostConfigPath())
-	cloudConfigController := cloudconfig.NewMemoryController(providerConfig)
+	cloudConfigController := cloudconfig.NewMemoryController(nil)
 
 	repo := cloudcost.NewMemoryRepository()
 	cloudCostPipelineService := cloudcost.NewPipelineService(repo, cloudConfigController, cloudcost.DefaultIngestorConfiguration())
 	repoQuerier := cloudcost.NewRepositoryQuerier(repo)
 	cloudCostQueryService := cloudcost.NewQueryService(repoQuerier, repoQuerier)
 
-	router.GET("/cloud/config/export", cloudConfigController.GetExportConfigHandler())
-	router.GET("/cloud/config/enable", cloudConfigController.GetEnableConfigHandler())
-	router.GET("/cloud/config/disable", cloudConfigController.GetDisableConfigHandler())
-	router.GET("/cloud/config/delete", cloudConfigController.GetDeleteConfigHandler())
+	registerCloudCostRoutes(router, cloudCostQueryService, cloudCostPipelineService, cloudConfigController)
 
-	router.GET("/cloudCost", cloudCostQueryService.GetCloudCostHandler())
-	router.GET("/cloudCost/view/graph", cloudCostQueryService.GetCloudCostViewGraphHandler())
-	router.GET("/cloudCost/view/totals", cloudCostQueryService.GetCloudCostViewTotalsHandler())
-	router.GET("/cloudCost/view/table", cloudCostQueryService.GetCloudCostViewTableHandler())
-
-	router.GET("/cloudCost/status", cloudCostPipelineService.GetCloudCostStatusHandler())
-	router.GET("/cloudCost/rebuild", cloudCostPipelineService.GetCloudCostRebuildHandler())
-	router.GET("/cloudCost/repair", cloudCostPipelineService.GetCloudCostRepairHandler())
+	return cloudCostPipelineService
 }
 
 func InitializeCustomCost(router *httprouter.Router) *customcost.PipelineService {
@@ -1498,24 +1076,48 @@ func InitializeCustomCost(router *httprouter.Router) *customcost.PipelineService
 	customCostQuerier := customcost.NewRepositoryQuerier(hourlyRepo, dailyRepo, ingConfig.HourlyDuration, ingConfig.DailyDuration)
 	customCostQueryService := customcost.NewQueryService(customCostQuerier)
 
-	router.GET("/customCost/total", customCostQueryService.GetCustomCostTotalHandler())
-	router.GET("/customCost/timeseries", customCostQueryService.GetCustomCostTimeseriesHandler())
+	registerCustomCostRoutes(router, customCostQueryService)
 
 	return customCostPipelineService
 }
 
-func writeErrorResponse(w http.ResponseWriter, code int, message string) {
-	out := map[string]string{
-		"message": message,
-	}
-	bytes, err := json.Marshal(out)
+// Response is the standard JSON envelope for API responses.
+type Response struct {
+	Code    int         `json:"code"`
+	Status  string      `json:"status"`
+	Data    interface{} `json:"data"`
+	Message string      `json:"message,omitempty"`
+	Warning string      `json:"warning,omitempty"`
+}
+
+// WrapData serializes data into the Response envelope and returns bytes.
+func WrapData(data interface{}, err error) []byte {
+	var resp []byte
 	if err != nil {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(500)
-		fmt.Fprint(w, "unable to marshall json for error")
-		log.Warnf("Failed to marshall JSON for error response: %s", err.Error())
-		return
+		log.Errorf("Error returned to client: %s", err.Error())
+		resp, _ = json.Marshal(&Response{
+			Code:    http.StatusInternalServerError,
+			Status:  "error",
+			Message: err.Error(),
+			Data:    data,
+		})
+	} else {
+		resp, err = json.Marshal(&Response{
+			Code:   http.StatusOK,
+			Status: "success",
+			Data:   data,
+		})
+		if err != nil {
+			log.Errorf("error marshaling response json: %s", err.Error())
+		}
 	}
-	w.WriteHeader(code)
-	fmt.Fprint(w, string(bytes))
+	return resp
+}
+
+func (a *Accesses) Status(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	w.Header().Set("Content-Type", "application/json")
+	proto.WriteData(w, map[string]interface{}{
+		"status":  "ok",
+		"version": version.FriendlyVersion(),
+	})
 }

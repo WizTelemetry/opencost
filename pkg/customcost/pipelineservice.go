@@ -37,6 +37,7 @@ func getRegisteredPlugins(configDir string, execDir string) (map[string]*plugin.
 	configFiles, err := os.ReadDir(configDir)
 	if err != nil {
 		log.Errorf("error reading files in directory %s: %v", configDir, err)
+		return nil, fmt.Errorf("failed to read plugin config directory: %w", err)
 	}
 
 	// list of plugins that we must run are the strings before _
@@ -68,9 +69,9 @@ func getRegisteredPlugins(configDir string, execDir string) (map[string]*plugin.
 		file := fmt.Sprintf(execFmt, execDir, name, runtime.GOOS, runtime.GOARCH)
 		log.Debugf("looking for file: %s", file)
 		if _, err := os.Stat(file); err != nil {
-			msg := fmt.Sprintf("error reading executable for %s plugin. Plugin executables must be in %s and have name format <plugin name>.ocplugin.<os>.<opencost binary archtecture (arm64 or amd64)>", name, execDir)
-			log.Errorf(msg)
-			return nil, fmt.Errorf(msg)
+			err := fmt.Errorf("error reading executable for %s plugin. Plugin executables must be in %s and have name format <plugin name>.ocplugin.<os>.<opencost binary archtecture (arm64 or amd64)>", name, execDir)
+			log.Errorf("err: %v", err)
+			return nil, err
 		}
 
 		var handshakeConfig = plugin.HandshakeConfig{
@@ -133,7 +134,7 @@ func NewPipelineService(hourlyrepo, dailyrepo Repository, ingConf CustomCostInge
 	dailyIngestor.Start(false)
 
 	var domains []string
-	for domain, _ := range registeredPlugins {
+	for domain := range registeredPlugins {
 		domains = append(domains, domain)
 	}
 
@@ -144,6 +145,26 @@ func NewPipelineService(hourlyrepo, dailyrepo Repository, ingConf CustomCostInge
 		dailyIngestor:  dailyIngestor,
 		domains:        domains,
 	}, nil
+}
+
+// Stop gracefully shuts down both hourly and daily ingestors.
+// Both ingestors may reference the same plugin clients, so Kill() may be invoked
+// multiple times per plugin, which is safe per the go-plugin library.
+func (ps *PipelineService) Stop() {
+	if ps == nil {
+		return
+	}
+	log.Infof("Shutting down CustomCost Pipeline Service")
+
+	if ps.hourlyIngestor != nil {
+		ps.hourlyIngestor.Stop()
+	}
+
+	if ps.dailyIngestor != nil {
+		ps.dailyIngestor.Stop()
+	}
+
+	log.Infof("CustomCost Pipeline Service stopped successfully")
 }
 
 // Status gives a combined view of the state of configs and the ingestor status
