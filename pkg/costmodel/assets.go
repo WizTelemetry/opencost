@@ -4,9 +4,49 @@ import (
 	"fmt"
 	"time"
 
+	coreenv "github.com/opencost/opencost/core/pkg/env"
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/opencost"
 )
+
+type assetStepCacheValue struct {
+	assetSet *opencost.AssetSet
+}
+
+const (
+	assetStepRealtimeTTLEnvVar    = "OPENCOST_ASSET_STEP_CACHE_TTL_SECONDS"
+	assetStepHistoricalTTLEnvVar  = "OPENCOST_ASSET_HISTORICAL_STEP_CACHE_TTL_SECONDS"
+	defaultAssetStepRealtimeTTL   = 30 * time.Second
+	defaultAssetStepHistoricalTTL = 10 * time.Minute
+)
+
+func assetStepRealtimeCacheTTL() time.Duration {
+	seconds := coreenv.GetInt(assetStepRealtimeTTLEnvVar, -1)
+	if seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultAssetStepRealtimeTTL
+}
+
+func assetStepHistoricalCacheTTL() time.Duration {
+	seconds := coreenv.GetInt(assetStepHistoricalTTLEnvVar, -1)
+	if seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultAssetStepHistoricalTTL
+}
+
+func assetStepCacheTTL(windowEnd time.Time) time.Duration {
+	now := time.Now()
+	if windowEnd.Add(time.Hour).Before(now) {
+		return assetStepHistoricalCacheTTL()
+	}
+	return assetStepRealtimeCacheTTL()
+}
+
+func assetStepCacheKey(start, end time.Time, resolution time.Duration) string {
+	return fmt.Sprintf("%d-%d-%s", start.Unix(), end.Unix(), resolution.String())
+}
 
 // clampTimeToRange does not permit timestamps to exceed a given start, end
 // range, inclusive of start and end times. For examples:
@@ -38,6 +78,41 @@ func clampTimeToRange(t time.Time, start, end time.Time) time.Time {
 }
 
 func (cm *CostModel) ComputeAssets(start, end time.Time) (*opencost.AssetSet, error) {
+	end = cm.queryEnd(end)
+	if !end.After(start) {
+		return opencost.NewAssetSet(start, end), nil
+	}
+
+	resolution := time.Duration(0)
+	if cm.DataSource != nil {
+		resolution = cm.DataSource.Resolution()
+	}
+
+	value, err := computeCachedStep(
+		cm,
+		assetStepCacheLayer,
+		cm.stepCacheKey(assetStepCacheKey(start, end, resolution)),
+		cm.assetStepCache,
+		assetStepCacheTTL(end),
+		func() (*assetStepCacheValue, error) {
+			assetSet, err := cm.computeAssetsUncached(start, end)
+			return &assetStepCacheValue{assetSet: assetSet}, err
+		},
+		func(value *assetStepCacheValue) *assetStepCacheValue {
+			if value == nil {
+				return nil
+			}
+			return &assetStepCacheValue{assetSet: value.assetSet.Clone()}
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return value.assetSet, nil
+}
+
+func (cm *CostModel) computeAssetsUncached(start, end time.Time) (*opencost.AssetSet, error) {
 	assetSet := opencost.NewAssetSet(start, end)
 
 	nodeMap, err := cm.ClusterNodes(start, end)

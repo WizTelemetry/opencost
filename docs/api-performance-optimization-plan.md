@@ -254,13 +254,21 @@ This can significantly improve cache hit rate for frontend polling and refreshes
 
 Goal: move from request-time Prometheus computation toward Kubecost-like precomputed reads.
 
+Status: implemented as an opt-in lightweight allocation ETL store. It persists
+raw, unaggregated allocation buckets with readiness metadata, composes them by
+time range, and computes only uncovered edge ranges live. Version 2 preserves
+labels, annotations, Services, and raw usage maxima during cross-bucket merges.
+Assets remain on the live computation path, backed by a bounded step cache,
+because rolling-window asset costs are not additive across independently
+computed buckets.
+
 ### 1. Add an ETL Worker
 
 Initial worker behavior:
 
 - Runs every `5m`.
-- Computes common allocation, asset, and efficiency aggregates.
-- Stores hourly and daily buckets.
+- Computes allocation data for common API queries.
+- Stores hourly and daily allocation buckets.
 
 Suggested environment variables:
 
@@ -314,13 +322,14 @@ Store keys should include:
 - aggregate
 - cluster or namespace filters when applicable
 - schema version
+- pricing/config fingerprint
+- readiness marker written only after the data file is complete
 
 Example:
 
 ```text
-allocation/daily/2026-05-21/aggregate=namespace/schema=v1
-assets/daily/2026-05-21/aggregate=type/schema=v1
-efficiency/daily/2026-05-21/aggregate=namespace/schema=v1
+etl/v2/<cluster>/<pricing-fingerprint>/allocation/86400s/....bingen
+etl/v2/<cluster>/<pricing-fingerprint>/allocation/86400s/....ready
 ```
 
 ### 4. Prefer Precomputed Reads in API Handlers
@@ -336,6 +345,9 @@ Rules:
 - If the query is fully covered by ETL buckets, return ETL data.
 - If only recent partial data is missing, combine ETL data with live computation for the missing range.
 - If filters are unsupported by ETL, fall back to live compute.
+- Do not publish a bucket until the data-source coverage window contains the whole bucket.
+- Rebuild recent buckets after late Prometheus data arrives; missing buckets take priority over refreshes.
+- Switch ETL revisions when cost-affecting pricing changes, and flush response plus step caches.
 
 ### 5. Add ETL Status Endpoint
 
@@ -416,17 +428,18 @@ Acceptance criteria:
 - Warmer does not run mutating endpoints.
 - Frontend common queries are warm after startup.
 
-### Task E: Relative Window Cache Key Normalization
+### Task E: Relative Window Cache Key Canonicalization
 
 Scope:
 
-- Normalize relative windows to 1-minute or 5-minute buckets.
+- Canonicalize query parameter order for relative windows.
 - Preserve exact absolute window behavior.
 - Add tests for cache key stability.
 
 Acceptance criteria:
 
-- Repeated `window=7d` requests within the same bucket share cache keys.
+- Repeated `window=7d` requests share one key bounded by the configured TTL.
+- The cache warmer refreshes that key without wall-clock bucket transitions.
 - Absolute timestamp windows are not unexpectedly rounded.
 
 ### Task F: Lightweight ETL Prototype

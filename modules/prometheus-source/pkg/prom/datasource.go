@@ -151,6 +151,29 @@ func NewPrometheusDataSource(infoProvider clusters.ClusterInfoProvider, promConf
 
 	log.Infof("Using scrape interval of %f", promConfig.ScrapeInterval.Seconds())
 
+	selection := selectQueryClusterLabel(promClient, promConfig)
+	if selection.Err != nil {
+		log.Warnf("Failed to verify Prometheus cluster label coverage: %v", selection.Err)
+	}
+	if selection.Label != promConfig.ClusterLabel {
+		log.Warnf(
+			"Configured Prometheus cluster label %q has insufficient KSM/kubelet coverage; using %q "+
+				"(configured=%+v, selected=%+v)",
+			promConfig.ClusterLabel,
+			selection.Label,
+			selection.ConfiguredCoverage,
+			selection.SelectedCoverage,
+		)
+		promConfig.SetEffectiveClusterLabel(selection.Label)
+	} else {
+		log.Infof(
+			"Using Prometheus query cluster label %q (KSM=%d, kubelet=%d)",
+			selection.Label,
+			selection.SelectedCoverage.KubeStateMetrics,
+			selection.SelectedCoverage.Kubelet,
+		)
+	}
+
 	promContexts := NewContextFactory(promClient, promConfig)
 
 	// metadata creation for cluster info

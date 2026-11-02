@@ -136,6 +136,11 @@ var (
 	networkNatGatewayIngressCostG prometheus.Gauge
 	clusterManagementCostGv       *prometheus.GaugeVec
 	lbCostGv                      *prometheus.GaugeVec
+	queryCacheHits                *prometheus.CounterVec
+	queryCacheMisses              *prometheus.CounterVec
+	querySingleflightShared       *prometheus.CounterVec
+	queryComputeErrors            *prometheus.CounterVec
+	queryComputeDuration          *prometheus.HistogramVec
 )
 
 // initCostModelMetrics uses a sync.Once to ensure that these metrics are only created once
@@ -291,6 +296,47 @@ func initCostModelMetrics(clusterInfo clusters.ClusterInfoProvider, metricsConfi
 			toRegisterGV = append(toRegisterGV, lbCostGv)
 		}
 
+		queryCacheHits = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opencost_query_cache_hits_total",
+			Help: "Total number of internal query step cache hits.",
+		}, []string{"layer"})
+		if _, disabled := disabledMetrics["opencost_query_cache_hits_total"]; !disabled {
+			prometheus.MustRegister(queryCacheHits)
+		}
+
+		queryCacheMisses = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opencost_query_cache_misses_total",
+			Help: "Total number of internal query step cache misses.",
+		}, []string{"layer"})
+		if _, disabled := disabledMetrics["opencost_query_cache_misses_total"]; !disabled {
+			prometheus.MustRegister(queryCacheMisses)
+		}
+
+		querySingleflightShared = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opencost_query_singleflight_shared_total",
+			Help: "Total number of query computations whose result was shared through singleflight.",
+		}, []string{"layer"})
+		if _, disabled := disabledMetrics["opencost_query_singleflight_shared_total"]; !disabled {
+			prometheus.MustRegister(querySingleflightShared)
+		}
+
+		queryComputeErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opencost_query_errors_total",
+			Help: "Total number of internal query step computation errors.",
+		}, []string{"layer"})
+		if _, disabled := disabledMetrics["opencost_query_errors_total"]; !disabled {
+			prometheus.MustRegister(queryComputeErrors)
+		}
+
+		queryComputeDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "opencost_query_compute_duration_seconds",
+			Help:    "Time spent computing internal query steps.",
+			Buckets: []float64{0.001, 0.01, 0.1, 0.3, 1, 3, 6, 9, 15, 30, 60},
+		}, []string{"layer"})
+		if _, disabled := disabledMetrics["opencost_query_compute_duration_seconds"]; !disabled {
+			prometheus.MustRegister(queryComputeDuration)
+		}
+
 		// Register cost-model metrics for emission
 		for _, gv := range toRegisterGV {
 			prometheus.MustRegister(gv)
@@ -305,6 +351,33 @@ func initCostModelMetrics(clusterInfo clusters.ClusterInfoProvider, metricsConfi
 			metricsConfig: *metricsConfig,
 		})
 	})
+}
+
+func recordQueryCacheResult(layer string, hit bool) {
+	if hit && queryCacheHits != nil {
+		queryCacheHits.WithLabelValues(layer).Inc()
+	}
+	if !hit && queryCacheMisses != nil {
+		queryCacheMisses.WithLabelValues(layer).Inc()
+	}
+}
+
+func recordQuerySingleflightShared(layer string) {
+	if querySingleflightShared != nil {
+		querySingleflightShared.WithLabelValues(layer).Inc()
+	}
+}
+
+func recordQueryComputeError(layer string) {
+	if queryComputeErrors != nil {
+		queryComputeErrors.WithLabelValues(layer).Inc()
+	}
+}
+
+func observeQueryComputeDuration(layer string, duration time.Duration) {
+	if queryComputeDuration != nil {
+		queryComputeDuration.WithLabelValues(layer).Observe(duration.Seconds())
+	}
 }
 
 //--------------------------------------------------------------------------

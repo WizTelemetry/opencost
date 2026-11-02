@@ -1811,3 +1811,20 @@ func getMockAssetSet(f float64) AssetSet {
 
 	return as
 }
+
+func TestAssetSetClonePreservesWarnings(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	assets := NewAssetSet(start, end)
+	assets.Warnings = []string{"warning"}
+
+	clone := assets.Clone()
+	if len(clone.Warnings) != 1 || clone.Warnings[0] != "warning" {
+		t.Fatalf("clone did not preserve warnings: %v", clone.Warnings)
+	}
+
+	clone.Warnings[0] = "changed"
+	if assets.Warnings[0] != "warning" {
+		t.Fatal("clone shares the warnings slice with the original")
+	}
+}

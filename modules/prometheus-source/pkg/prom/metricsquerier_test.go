@@ -59,6 +59,42 @@ func (mpc *NoOpPromClient) Do(c context.Context, req *http.Request) (*http.Respo
 
 }
 
+type EmptyCoveragePromClient struct {
+	NoOpPromClient
+}
+
+func (mpc *EmptyCoveragePromClient) Do(c context.Context, req *http.Request) (*http.Response, []byte, error) {
+	body := []byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}, body, nil
+}
+
+func TestQueryDataCoverageStrictDoesNotUseFallback(t *testing.T) {
+	t.Setenv("PROMETHEUS_SERVER_ENDPOINT", "nowhere")
+
+	config, err := NewOpenCostPrometheusConfigFromEnv()
+	if err != nil {
+		t.Fatalf("Failed to create OpenCost Prometheus config: %v", err)
+	}
+
+	mock := new(EmptyCoveragePromClient)
+	querier := newPrometheusMetricsQuerier(config, mock, NewContextFactory(mock, config))
+
+	if _, _, err := querier.QueryDataCoverageStrict(7); err == nil {
+		t.Fatal("expected strict coverage query to fail when the metric is missing")
+	}
+
+	oldest, newest, err := querier.QueryDataCoverage(7)
+	if err != nil {
+		t.Fatalf("permissive coverage query should retain the existing fallback: %v", err)
+	}
+	if !newest.After(oldest) {
+		t.Fatalf("expected a non-empty fallback range, got %s - %s", oldest, newest)
+	}
+}
+
 func TestQueryLogs(t *testing.T) {
 	// init logging
 	initLogging(t, "debug", false)

@@ -1846,6 +1846,18 @@ func (pds *PrometheusMetricsQuerier) QueryResourceQuotaStatusUsedRAMLimitMax(sta
 }
 
 func (pds *PrometheusMetricsQuerier) QueryDataCoverage(limitDays int) (time.Time, time.Time, error) {
+	return pds.queryDataCoverage(limitDays, false)
+}
+
+// QueryDataCoverageStrict returns data-source coverage without substituting a
+// synthetic time range when the coverage metric is missing or incomplete.
+// ETL callers must use this form so incomplete Prometheus data is never
+// persisted as a finished allocation bucket.
+func (pds *PrometheusMetricsQuerier) QueryDataCoverageStrict(limitDays int) (time.Time, time.Time, error) {
+	return pds.queryDataCoverage(limitDays, true)
+}
+
+func (pds *PrometheusMetricsQuerier) queryDataCoverage(limitDays int, strict bool) (time.Time, time.Time, error) {
 	const (
 		queryName            = "QueryDataCoverage"
 		queryFmtOldestSample = `min_over_time(timestamp(group(node_cpu_hourly_cost{%s}))[%s:%s])`
@@ -1871,6 +1883,10 @@ func (pds *PrometheusMetricsQuerier) QueryDataCoverage(limitDays int) (time.Time
 		return time.Time{}, time.Time{}, fmt.Errorf("querying oldest sample: %w", err)
 	}
 	if len(resOldest) == 0 || len(resOldest[0].Values) == 0 {
+		if strict {
+			return time.Time{}, time.Time{}, fmt.Errorf("node_cpu_hourly_cost coverage is unavailable")
+		}
+
 		// If node_cpu_hourly_cost metric is not available, fallback to a reasonable time range
 		// This prevents CSV export from failing when the metric doesn't exist yet
 		log.Warnf("QueryDataCoverage: node_cpu_hourly_cost metric not available, using fallback time range")
@@ -1894,6 +1910,10 @@ func (pds *PrometheusMetricsQuerier) QueryDataCoverage(limitDays int) (time.Time
 		return time.Time{}, time.Time{}, fmt.Errorf("querying newest sample: %w", err)
 	}
 	if len(resNewest) == 0 || len(resNewest[0].Values) == 0 {
+		if strict {
+			return time.Time{}, time.Time{}, fmt.Errorf("node_cpu_hourly_cost coverage has no newest sample")
+		}
+
 		// If newest query fails but oldest succeeded, use oldest as both start and end
 		// This allows CSV export to proceed with at least some time range
 		log.Warnf("QueryDataCoverage: newest sample query returned no results, using oldest timestamp")

@@ -179,8 +179,14 @@ func GetPromClusterLabel() string {
 // GetPromClusterFilter returns environment variable value CurrentClusterIdFilterEnabledVar which
 // represents additional prometheus filter for all metrics for current cluster id
 func GetPromClusterFilter() string {
+	return GetPromClusterFilterForLabel(GetPromClusterLabel())
+}
+
+// GetPromClusterFilterForLabel returns the current-cluster filter using the
+// effective query label selected at startup.
+func GetPromClusterFilterForLabel(clusterLabel string) string {
 	if env.GetBool(CurrentClusterIdFilterEnabledVar, false) {
-		return fmt.Sprintf("%s=\"%s\"", GetPromClusterLabel(), env.GetClusterID())
+		return fmt.Sprintf("%s=%q", clusterLabel, env.GetClusterID())
 	}
 	return ""
 }

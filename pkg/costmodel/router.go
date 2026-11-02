@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/opencost/opencost/core/pkg/kubeconfig"
@@ -84,6 +85,7 @@ type Accesses struct {
 	ClusterInfoProvider clusters.ClusterInfoProvider
 	Model               *CostModel
 	MetricsEmitter      *CostModelMetricsEmitter
+	ETLWorker           *ETLWorker
 	// SettingsCache stores current state of app settings
 	SettingsCache *cache.Cache
 	// QueryCache stores query responses for repeated API queries
@@ -92,7 +94,10 @@ type Accesses struct {
 	// settings will be published in a pub/sub model
 	settingsSubscribers map[string][]chan string
 	settingsMutex       sync.Mutex
+	queryCacheEpoch     atomic.Uint64
 }
+
+type queryCacheEpochContextKey struct{}
 
 func newQueryCache() *cache.Cache {
 	ttl := queryCacheBaseTTL()
@@ -144,9 +149,32 @@ func historicalQueryCacheTTL() time.Duration {
 func queryCacheKey(endpoint string, r *http.Request) string {
 	if r != nil && r.URL != nil {
 		normalized := normalizeCacheWindow(r.URL.RawQuery)
+		if epoch, _ := r.Context().Value(queryCacheEpochContextKey{}).(uint64); epoch > 0 {
+			return fmt.Sprintf("%d:%s:%s?%s", epoch, endpoint, canonicalCachePath(r.URL.Path), normalized)
+		}
 		return fmt.Sprintf("%s:%s?%s", endpoint, canonicalCachePath(r.URL.Path), normalized)
 	}
 	return endpoint
+}
+
+func (a *Accesses) withQueryCacheEpoch(r *http.Request) *http.Request {
+	if a == nil || r == nil {
+		return r
+	}
+	epoch := a.queryCacheEpoch.Load()
+	return r.WithContext(context.WithValue(r.Context(), queryCacheEpochContextKey{}, epoch))
+}
+
+// QueryCacheEpochMiddleware snapshots the cache generation at request entry.
+// A request that began before a pricing change therefore cannot overwrite the
+// new generation when its older computation finishes.
+func (a *Accesses) QueryCacheEpochMiddleware(next http.Handler) http.Handler {
+	if next == nil {
+		return nil
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, a.withQueryCacheEpoch(r))
+	})
 }
 
 func canonicalCachePath(path string) string {
@@ -162,9 +190,10 @@ func canonicalCachePath(path string) string {
 	}
 }
 
-// normalizeCacheWindow rounds relative window parameters to 5-minute buckets
-// to improve cache hit rate for frontend polling. Absolute timestamp windows
-// are preserved unchanged.
+// normalizeCacheWindow canonicalizes relative-window query strings. Freshness
+// is controlled by the response TTL and cache warmer rather than by rotating
+// the key at fixed wall-clock boundaries, which would create predictable cold
+// windows whenever a new bucket begins before the next warm run.
 func normalizeCacheWindow(rawQuery string) string {
 	if rawQuery == "" {
 		return rawQuery
@@ -186,15 +215,13 @@ func normalizeCacheWindow(rawQuery string) string {
 		return rawQuery
 	}
 
-	// Relative window: add a bucket key truncated to 5-minute intervals.
-	bucketed := time.Now().UTC().Truncate(5 * time.Minute)
-	values.Set("__normalized_at", bucketed.Format(time.RFC3339))
-
+	// Relative window: sort/canonicalize parameters while retaining the value.
+	// The cache TTL bounds staleness, and the warmer refreshes this same key.
 	return values.Encode()
 }
 
 func (a *Accesses) getQueryCacheResponse(endpoint string, r *http.Request) ([]byte, bool) {
-	if a == nil || a.QueryCache == nil {
+	if a == nil || a.QueryCache == nil || isCacheWarmerRequest(r) {
 		return nil, false
 	}
 
@@ -355,6 +382,7 @@ func registerAccessesRoutes(router *httprouter.Router, a *Accesses) {
 	registerGETWithPrefix(router, "/orphanedPods", a.GetOrphanedPods)
 	registerGETWithPrefix(router, "/installNamespace", a.GetInstallNamespace)
 	registerGETWithPrefix(router, "/installInfo", a.GetInstallInfo)
+	registerGETWithPrefix(router, "/etl/status", a.GetETLStatus)
 	registerPOSTWithPrefix(router, "/serviceKey", adminAuthMiddleware(a.AddServiceKey))
 	registerGETWithPrefix(router, "/helmValues", a.GetHelmValues)
 }

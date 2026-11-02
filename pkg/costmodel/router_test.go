@@ -125,7 +125,7 @@ func TestQueryCacheKey_NormalizesRelativeWindow(t *testing.T) {
 	req1 := httptest.NewRequest(http.MethodGet, "/allocation?window=7d&aggregate=namespace", nil)
 	req2 := httptest.NewRequest(http.MethodGet, "/allocation?window=7d&aggregate=namespace", nil)
 
-	// Within the same 5-minute bucket, keys should be identical
+	// Identical relative windows should share a key until the TTL refreshes it.
 	key1 := queryCacheKey("allocation", req1)
 	key2 := queryCacheKey("allocation", req2)
 	assert.Equal(t, key1, key2, "identical relative windows within same bucket should produce same key")
@@ -174,10 +174,13 @@ func TestNormalizeCacheWindow(t *testing.T) {
 		assert.Equal(t, q, normalizeCacheWindow(q))
 	})
 
-	t.Run("relative window adds normalized_at", func(t *testing.T) {
+	t.Run("relative window remains stable without time buckets", func(t *testing.T) {
 		result := normalizeCacheWindow("window=7d&aggregate=namespace")
-		assert.Contains(t, result, "__normalized_at=")
-		assert.Contains(t, result, "window=7d")
+		assert.NotContains(t, result, "__normalized_at=")
+		assert.Equal(t, "aggregate=namespace&window=7d", result)
+
+		reordered := normalizeCacheWindow("aggregate=namespace&window=7d")
+		assert.Equal(t, result, reordered)
 	})
 
 	t.Run("absolute window with comma preserved", func(t *testing.T) {

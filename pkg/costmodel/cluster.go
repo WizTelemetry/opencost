@@ -714,6 +714,8 @@ func pvCosts(
 	cp models.Provider,
 	window opencost.Window,
 ) {
+	invalidPVSizes := map[DiskIdentifier]struct{}{}
+
 	for _, result := range resActiveMins {
 		cluster := result.Cluster
 		if cluster == "" {
@@ -766,6 +768,10 @@ func pvCosts(
 
 		bytes := result.Data[0].Value
 		key := DiskIdentifier{cluster, name}
+		if !isValidPVSizeBytes(bytes) {
+			invalidPVSizes[key] = struct{}{}
+			continue
+		}
 		if _, ok := diskMap[key]; !ok {
 			diskMap[key] = &Disk{
 				Cluster:   cluster,
@@ -954,6 +960,10 @@ func pvCosts(
 			}
 		}
 		diskMap[key].BytesUsedMaxPtr = &usage
+	}
+
+	for key := range invalidPVSizes {
+		delete(diskMap, key)
 	}
 }
 

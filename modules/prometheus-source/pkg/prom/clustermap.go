@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencost/opencost/modules/prometheus-source/pkg/env"
-
 	"github.com/opencost/opencost/core/pkg/clusters"
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/source"
@@ -62,8 +60,8 @@ func newPrometheusClusterMap(contextFactory *ContextFactory, cip clusters.Cluste
 }
 
 // clusterInfoQuery returns the query string to load cluster info
-func clusterInfoQuery(offset string) string {
-	return fmt.Sprintf("kubecost_cluster_info{%s}%s", env.GetPromClusterFilter(), offset)
+func clusterInfoQuery(config *OpenCostPrometheusConfig, offset string) string {
+	return fmt.Sprintf("kubecost_cluster_info{%s}%s", config.ClusterFilter, offset)
 }
 
 // loadClusters loads all the cluster info to map
@@ -73,7 +71,7 @@ func (pcm *PrometheusClusterMap) loadClusters() (map[string]*clusters.ClusterInf
 	// Execute Query
 	tryQuery := func() (interface{}, error) {
 		ctx := pcm.contextFactory.NewNamedContext(ClusterMapContextName)
-		resCh := ctx.QueryAtTime(clusterInfoQuery(offset), time.Now())
+		resCh := ctx.QueryAtTime(clusterInfoQuery(pcm.contextFactory.config, offset), time.Now())
 		r, e := resCh.Await()
 		return r, e
 	}

@@ -245,10 +245,16 @@ func (r *RawAllocationOnlyData) Clone() *RawAllocationOnlyData {
 		return nil
 	}
 
+	var gpuUsageMax *float64
+	if r.GPUUsageMax != nil {
+		value := *r.GPUUsageMax
+		gpuUsageMax = &value
+	}
+
 	return &RawAllocationOnlyData{
 		CPUCoreUsageMax:  r.CPUCoreUsageMax,
 		RAMBytesUsageMax: r.RAMBytesUsageMax,
-		GPUUsageMax:      r.GPUUsageMax,
+		GPUUsageMax:      gpuUsageMax,
 	}
 }
 
@@ -2881,7 +2887,7 @@ func (as *AllocationSet) Clone() *AllocationSet {
 	}
 
 	if as.Warnings != nil {
-		warnings := make([]string, len(as.Warnings))
+		warnings = make([]string, len(as.Warnings))
 		copy(warnings, as.Warnings)
 	} else {
 		warnings = nil

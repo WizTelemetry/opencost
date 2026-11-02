@@ -2672,6 +2672,27 @@
         }
       }
     },
+    "/kapis/costwise.wiztelemetry.io/v1alpha1/etl/status": {
+      "get": {
+        "description": "返回 ETL 开关、存储路径、最近运行时间和桶构建结果。",
+        "tags": [
+          "ETL"
+        ],
+        "summary": "查询 ETL 状态",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/costmodel.ETLWorkerStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/helmValues": {
       "get": {
         "description": "返回当前部署的 Helm values；如果未开启暴露则返回提示信息。",
@@ -3093,6 +3114,71 @@
             "type": "string"
           },
           "startTime": {
+            "type": "string"
+          }
+        }
+      },
+      "costmodel.ETLWorkerStatus": {
+        "type": "object",
+        "properties": {
+          "dailyBucketsAttempted": {
+            "type": "integer"
+          },
+          "dailyBucketsFailed": {
+            "type": "integer"
+          },
+          "dailyBucketsSkipped": {
+            "type": "integer"
+          },
+          "dailyBucketsWritten": {
+            "type": "integer"
+          },
+          "dailyRetentionDays": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "hourlyBucketsAttempted": {
+            "type": "integer"
+          },
+          "hourlyBucketsFailed": {
+            "type": "integer"
+          },
+          "hourlyBucketsSkipped": {
+            "type": "integer"
+          },
+          "hourlyBucketsWritten": {
+            "type": "integer"
+          },
+          "hourlyRetentionHours": {
+            "type": "integer"
+          },
+          "lastError": {
+            "type": "string"
+          },
+          "lastRunCompletedAt": {
+            "type": "string"
+          },
+          "lastRunDurationSeconds": {
+            "type": "number"
+          },
+          "lastRunStartedAt": {
+            "type": "string"
+          },
+          "lastSuccessfulRunAt": {
+            "type": "string"
+          },
+          "resolutionSeconds": {
+            "type": "integer"
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "schemaVersion": {
+            "type": "string"
+          },
+          "storagePath": {
             "type": "string"
           }
         }

@@ -67,6 +67,7 @@ func Execute(conf *Config) error {
 	router := httprouter.New()
 	var a *costmodel.Accesses
 	var cacheWarmer *costmodel.CacheWarmer
+	var etlWorker *costmodel.ETLWorker
 
 	if conf.KubernetesEnabled {
 		a = costmodel.Initialize(router)
@@ -82,6 +83,11 @@ func Execute(conf *Config) error {
 		cacheWarmer = costmodel.NewCacheWarmer(a)
 		cacheWarmer.Start()
 
+		// Build immutable allocation buckets in the background. API
+		// requests read completed buckets and compute only uncovered ranges.
+		etlWorker = costmodel.NewETLWorker(a)
+		a.ETLWorker = etlWorker
+		etlWorker.Start()
 	}
 
 	var cloudCostPipelineService *cloudcost.PipelineService
@@ -127,6 +133,9 @@ func Execute(conf *Config) error {
 	rootMux.Handle("/metrics", promhttp.Handler())
 	telemetryHandler := metrics.ResponseMetricMiddleware(rootMux)
 	handler := cors.AllowAll().Handler(telemetryHandler)
+	if a != nil {
+		handler = a.QueryCacheEpochMiddleware(handler)
+	}
 
 	server := &http.Server{
 		Addr:    fmt.Sprint(":", conf.Port),
@@ -154,6 +163,10 @@ func Execute(conf *Config) error {
 
 		if cacheWarmer != nil {
 			cacheWarmer.Stop()
+		}
+
+		if etlWorker != nil {
+			etlWorker.Stop()
 		}
 
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
