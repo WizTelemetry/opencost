@@ -8,8 +8,8 @@ import (
 	"github.com/opencost/opencost/core/pkg/source"
 	"github.com/opencost/opencost/core/pkg/util/timeutil"
 
-	"github.com/opencost/opencost/core/pkg/log"
 	coreenv "github.com/opencost/opencost/core/pkg/env"
+	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/pkg/env"
 )
 
@@ -77,6 +77,10 @@ func cloneNodeMap(src map[nodeKey]*nodePricing) map[nodeKey]*nodePricing {
 	}
 	dst := make(map[nodeKey]*nodePricing, len(src))
 	for k, v := range src {
+		if v == nil {
+			dst[k] = nil
+			continue
+		}
 		copyVal := *v
 		dst[k] = &copyVal
 	}
@@ -101,6 +105,10 @@ func (cm *CostModel) Name() string {
 // for the window defined by the given start and end times. The Allocations
 // returned are unaggregated (i.e. down to the container level).
 func (cm *CostModel) ComputeAllocation(start, end time.Time) (*opencost.AllocationSet, error) {
+	end = cm.queryEnd(end)
+	if !end.After(start) {
+		return opencost.NewAllocationSet(start, end), nil
+	}
 	return cm.computeAllocationWithPushdown(start, end, nil)
 }
 
@@ -254,22 +262,52 @@ func (cm *CostModel) computeAllocation(start, end time.Time) (*opencost.Allocati
 }
 
 func (cm *CostModel) computeAllocationStep(start, end time.Time, pushdown *allocationQueryPushdown) (*opencost.AllocationSet, map[nodeKey]*nodePricing, error) {
-	// 1. Build out Pod map from resolution-tuned, batched Pod start/end query
-	// 2. Run and apply the results of the remaining queries to
-	// 3. Build out AllocationSet from completed Pod map
 	resolution := time.Duration(0)
 	if cm.DataSource != nil {
 		resolution = cm.DataSource.Resolution()
 	}
 
-	if cm.allocStepCache != nil {
-		key := allocStepCacheKeyWithPushdown(start, end, resolution, pushdown)
-		if val, found := cm.allocStepCache.Get(key); found {
-			cached := val.(*allocStepCacheValue)
-			return cached.allocSet.Clone(), cloneNodeMap(cached.nodeMap), nil
-		}
+	value, err := computeCachedStep(
+		cm,
+		allocationStepCacheLayer,
+		cm.stepCacheKey(allocStepCacheKeyWithPushdown(start, end, resolution, pushdown)),
+		cm.allocStepCache,
+		allocStepCacheTTL(end),
+		func() (*allocStepCacheValue, error) {
+			allocSet, nodeMap, err := cm.computeAllocationStepWithETL(start, end, resolution, pushdown)
+			return &allocStepCacheValue{allocSet: allocSet, nodeMap: nodeMap}, err
+		},
+		func(value *allocStepCacheValue) *allocStepCacheValue {
+			if value == nil {
+				return nil
+			}
+			return &allocStepCacheValue{
+				allocSet: value.allocSet.Clone(),
+				nodeMap:  cloneNodeMap(value.nodeMap),
+			}
+		},
+	)
+	if err != nil {
+		return nil, nil, err
 	}
 
+	return value.allocSet, value.nodeMap, nil
+}
+
+func (cm *CostModel) computeAllocationStepWithETL(start, end time.Time, resolution time.Duration, pushdown *allocationQueryPushdown) (*opencost.AllocationSet, map[nodeKey]*nodePricing, error) {
+	if etlSet, used, err := cm.allocationSetWithETL(start, end, resolution, pushdown); err != nil {
+		log.Warnf("ETL allocation composition failed; falling back to live computation: %v", err)
+	} else if used {
+		return etlSet, nil, nil
+	}
+
+	return cm.computeAllocationStepUncached(start, end, resolution, pushdown)
+}
+
+func (cm *CostModel) computeAllocationStepUncached(start, end time.Time, resolution time.Duration, pushdown *allocationQueryPushdown) (*opencost.AllocationSet, map[nodeKey]*nodePricing, error) {
+	// 1. Build out Pod map from resolution-tuned, batched Pod start/end query
+	// 2. Run and apply the results of the remaining queries to
+	// 3. Build out AllocationSet from completed Pod map
 	// Create a window spanning the requested query
 	window := opencost.NewWindow(&start, &end)
 
@@ -602,13 +640,6 @@ func (cm *CostModel) computeAllocationStep(start, end time.Time, pushdown *alloc
 			alloc.Name = fmt.Sprintf("%s/%s/%s/%s/%s", cluster, nodeName, namespace, podName, container)
 			allocSet.Set(alloc)
 		}
-	}
-
-	if cm.allocStepCache != nil {
-		cm.allocStepCache.Set(allocStepCacheKeyWithPushdown(start, end, resolution, pushdown), &allocStepCacheValue{
-			allocSet: allocSet.Clone(),
-			nodeMap:  cloneNodeMap(nodeMap),
-		}, allocStepCacheTTL(end))
 	}
 
 	return allocSet, nodeMap, nil

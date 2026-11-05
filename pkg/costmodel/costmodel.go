@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/opencost/opencost/core/pkg/clustercache"
@@ -61,8 +63,12 @@ type CostModel struct {
 	DataSource      source.OpenCostDataSource
 	Provider        costAnalyzerCloud.Provider
 	KubeModel       *km.KubeModel
+	ETL             *ETLStore
 	pricingMetadata *costAnalyzerCloud.PricingMatchMetadata
 	allocStepCache  *cache.Cache
+	assetStepCache  *cache.Cache
+	requestGroupMu  sync.Mutex
+	cacheEpoch      atomic.Uint64
 }
 
 func NewCostModel(
@@ -86,7 +92,7 @@ func NewCostModel(
 		}
 	}
 
-	return &CostModel{
+	costModel := &CostModel{
 		Cache:          cache,
 		ClusterMap:     clusterMap,
 		BatchDuration:  batchDuration,
@@ -95,11 +101,90 @@ func NewCostModel(
 		RequestGroup:   requestGroup,
 		KubeModel:      kubeModel,
 		allocStepCache: newAllocStepCache(),
+		assetStepCache: newAssetStepCache(),
 	}
+
+	if etlStore, enabled, err := newETLStoreFromEnv(clusterUID); err != nil {
+		log.Errorf("Failed to initialize ETL store; falling back to live computation: %v", err)
+	} else if enabled {
+		etlStore.pricing = func() (string, error) {
+			if provider == nil {
+				return defaultETLPricingFingerprint, nil
+			}
+			pricing, err := provider.GetConfig()
+			if err != nil {
+				return "", err
+			}
+			return etlPricingFingerprint(pricing), nil
+		}
+		costModel.ETL = etlStore
+	}
+
+	return costModel
 }
 
 func newAllocStepCache() *cache.Cache {
 	return cache.New(defaultAllocStepCacheTTL, 2*defaultAllocStepCacheTTL)
+}
+
+func newAssetStepCache() *cache.Cache {
+	return cache.New(defaultAllocStepCacheTTL, 2*defaultAllocStepCacheTTL)
+}
+
+func clampQueryEndToNow(end, now time.Time, resolution time.Duration) time.Time {
+	if !end.After(now) {
+		return end
+	}
+	if resolution <= 0 {
+		resolution = time.Minute
+	}
+	return now.Truncate(resolution)
+}
+
+func (cm *CostModel) queryEnd(end time.Time) time.Time {
+	resolution := time.Minute
+	if cm != nil && cm.DataSource != nil {
+		if dataResolution := cm.DataSource.Resolution(); dataResolution > 0 {
+			resolution = dataResolution
+		}
+	}
+	return clampQueryEndToNow(end, time.Now().UTC(), resolution)
+}
+
+// requestGroup returns the shared singleflight group, including for tests or
+// callers that construct CostModel directly instead of using NewCostModel.
+func (cm *CostModel) requestGroup() *singleflight.Group {
+	cm.requestGroupMu.Lock()
+	defer cm.requestGroupMu.Unlock()
+
+	if cm.RequestGroup == nil {
+		cm.RequestGroup = new(singleflight.Group)
+	}
+	return cm.RequestGroup
+}
+
+func (cm *CostModel) stepCacheKey(key string) string {
+	epoch := cm.cacheEpoch.Load()
+	if epoch == 0 {
+		return key
+	}
+	return fmt.Sprintf("%d:%s", epoch, key)
+}
+
+func (cm *CostModel) flushStepCaches() {
+	if cm == nil {
+		return
+	}
+
+	// Rotate keys before flushing so a computation that started under the old
+	// pricing revision cannot repopulate the current cache generation.
+	cm.cacheEpoch.Add(1)
+	if cm.allocStepCache != nil {
+		cm.allocStepCache.Flush()
+	}
+	if cm.assetStepCache != nil {
+		cm.assetStepCache.Flush()
+	}
 }
 
 func (cm *CostModel) ComputeKubeModelSet(start, end time.Time) (*kubemodel.KubeModelSet, error) {
@@ -1715,6 +1800,13 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 	stepEnd := stepStart.Add(step)
 	var isAKS bool
 	for queryWindow.End().After(stepStart) {
+		queryStepEnd := cm.queryEnd(stepEnd)
+		if !queryStepEnd.After(stepStart) {
+			stepStart = stepEnd
+			stepEnd = stepStart.Add(step)
+			continue
+		}
+
 		var allocSet *opencost.AllocationSet
 
 		if includeIdle {
@@ -1723,17 +1815,17 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 
 			g.Go(func() error {
 				var err error
-				allocSet, err = cm.computeAllocationWithPushdown(stepStart, stepEnd, queryPushdown)
+				allocSet, err = cm.computeAllocationWithPushdown(stepStart, queryStepEnd, queryPushdown)
 				if err != nil {
-					return fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+					return fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, queryStepEnd), err)
 				}
 				return nil
 			})
 			g.Go(func() error {
 				var err error
-				assetSet, err = cm.ComputeAssets(stepStart, stepEnd)
+				assetSet, err = cm.ComputeAssets(stepStart, queryStepEnd)
 				if err != nil {
-					return fmt.Errorf("error computing assets for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+					return fmt.Errorf("error computing assets for %s: %w", opencost.NewClosedWindow(stepStart, queryStepEnd), err)
 				}
 				return nil
 			})
@@ -1763,7 +1855,7 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 
 			idleSet, err := computeIdleAllocations(allocSet, assetSet, idleByNode)
 			if err != nil {
-				return nil, fmt.Errorf("error computing idle allocations for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+				return nil, fmt.Errorf("error computing idle allocations for %s: %w", opencost.NewClosedWindow(stepStart, queryStepEnd), err)
 			}
 
 			for _, idleAlloc := range idleSet.Allocations {
@@ -1771,9 +1863,9 @@ func (cm *CostModel) QueryAllocation(window opencost.Window, step time.Duration,
 			}
 		} else {
 			var err error
-			allocSet, err = cm.computeAllocationWithPushdown(stepStart, stepEnd, queryPushdown)
+			allocSet, err = cm.computeAllocationWithPushdown(stepStart, queryStepEnd, queryPushdown)
 			if err != nil {
-				return nil, fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, stepEnd), err)
+				return nil, fmt.Errorf("error computing allocations for %s: %w", opencost.NewClosedWindow(stepStart, queryStepEnd), err)
 			}
 		}
 

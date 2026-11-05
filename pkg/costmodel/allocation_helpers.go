@@ -20,13 +20,27 @@ import (
 // Ideally you cap each pod to the max CPU on its node, but that involves a bit more complexity, as it it would need to be done when allocations joins with asset data.
 const CPU_SANITY_LIMIT = 512
 
-// Sanity Limit for PV usage, set to 10 PB, in bytes for now
+// Sanity limit for persistent-volume sizes, set to 10 PiB.
 const KiB = 1024.0
 const MiB = 1024.0 * KiB
 const GiB = 1024.0 * MiB
 const TiB = 1024.0 * GiB
 const PiB = 1024.0 * TiB
-const PV_USAGE_SANITY_LIMIT_BYTES = 10.0 * PiB
+const PV_SIZE_SANITY_LIMIT_BYTES = 10.0 * PiB
+
+func isValidPVSizeBytes(bytes float64) bool {
+	return bytes > 0 && bytes < PV_SIZE_SANITY_LIMIT_BYTES
+}
+
+func resolvePVSizeBytes(preferred, fallback float64) float64 {
+	if isValidPVSizeBytes(preferred) {
+		return preferred
+	}
+	if isValidPVSizeBytes(fallback) {
+		return fallback
+	}
+	return 0
+}
 
 const (
 	GpuUsageAverageMode = "AVERAGE"
@@ -2159,13 +2173,7 @@ func applyPVBytes(pvMap map[pvKey]*pv, resPVBytes []*source.PVBytesResult) {
 			continue
 		}
 
-		pvBytesUsed := res.Data[0].Value
-		if pvBytesUsed < PV_USAGE_SANITY_LIMIT_BYTES {
-			pvMap[key].Bytes = pvBytesUsed
-		} else {
-			pvMap[key].Bytes = 0
-			log.Warnf("PV usage exceeds sanity limit, clamping to zero")
-		}
+		pvMap[key].Bytes = resolvePVSizeBytes(res.Data[0].Value, 0)
 	}
 }
 
@@ -2225,7 +2233,12 @@ func applyPVCBytesRequested(pvcMap map[pvcKey]*pvc, resPVCBytesRequested []*sour
 			continue
 		}
 
-		pvcMap[key].Bytes = res.Data[0].Value
+		pvc := pvcMap[key]
+		var capacity float64
+		if pvc.Volume != nil {
+			capacity = pvc.Volume.Bytes
+		}
+		pvc.Bytes = resolvePVSizeBytes(res.Data[0].Value, capacity)
 	}
 }
 

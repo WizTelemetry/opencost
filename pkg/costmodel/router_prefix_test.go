@@ -24,6 +24,8 @@ func TestRegisterAccessesRoutesRegistersPrefixedAndLegacyRoutes(t *testing.T) {
 		{method: http.MethodGet, path: RoutePrefix + "/clusterInfo"},
 		{method: http.MethodGet, path: "/customPricing"},
 		{method: http.MethodGet, path: RoutePrefix + "/customPricing"},
+		{method: http.MethodGet, path: "/etl/status"},
+		{method: http.MethodGet, path: RoutePrefix + "/etl/status"},
 		{method: http.MethodPost, path: "/spotUpdate"},
 		{method: http.MethodPost, path: RoutePrefix + "/spotUpdate"},
 	}

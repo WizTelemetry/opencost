@@ -1,9 +1,12 @@
 package costmodel
 
 import (
+	"context"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -88,4 +91,36 @@ func TestWarmHandlerForPath(t *testing.T) {
 func TestParseEndpoints_StripsGetPrefix(t *testing.T) {
 	result := parseEndpoints("GET /allocation?window=7d;GET /assets?window=7d")
 	assert.Equal(t, []string{"/allocation?window=7d", "/assets?window=7d"}, result)
+}
+
+func TestCacheWarmerBypassesQueryResponseCacheRead(t *testing.T) {
+	queryCache := cache.New(time.Minute, time.Minute)
+	a := &Accesses{QueryCache: queryCache}
+	req := httptest.NewRequest("GET", "/allocation?window=7d", nil)
+	a.setQueryCacheResponseWithTTL("allocation", req, []byte(`{"data":[]}`), time.Minute)
+
+	_, found := a.getQueryCacheResponse("allocation", req)
+	assert.True(t, found)
+
+	warmedReq := req.WithContext(context.WithValue(req.Context(), cacheWarmerContextKey{}, true))
+	_, found = a.getQueryCacheResponse("allocation", warmedReq)
+	assert.False(t, found, "the warmer must recompute and refresh step caches")
+}
+
+func TestCacheWarmerFlushesStepCaches(t *testing.T) {
+	allocationCache := cache.New(time.Minute, time.Minute)
+	assetCache := cache.New(time.Minute, time.Minute)
+	allocationCache.Set("allocation-step", "stale", cache.DefaultExpiration)
+	assetCache.Set("asset-step", "stale", cache.DefaultExpiration)
+
+	cw := &CacheWarmer{
+		accesses: &Accesses{Model: &CostModel{
+			allocStepCache: allocationCache,
+			assetStepCache: assetCache,
+		}},
+	}
+	cw.flushStepCaches()
+
+	assert.Equal(t, 0, allocationCache.ItemCount())
+	assert.Equal(t, 0, assetCache.ItemCount())
 }

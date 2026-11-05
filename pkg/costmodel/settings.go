@@ -51,9 +51,24 @@ func (a *Accesses) InitializeSettingsPubSub() {
 		a.SubscribeToDiscountChanges(costDataCacheCh)
 		for {
 			msg := <-costDataCacheCh
-			log.Infof("Flushing cost data caches: %s", msg)
+			a.flushCostDataCaches(msg)
 		}
 	}(a)
+}
+
+func (a *Accesses) flushCostDataCaches(reason string) {
+	if a == nil {
+		return
+	}
+
+	log.Infof("Flushing cost data caches: %s", reason)
+	a.queryCacheEpoch.Add(1)
+	if a.QueryCache != nil {
+		a.QueryCache.Flush()
+	}
+	if a.Model != nil {
+		a.Model.flushStepCaches()
+	}
 }
 
 // SubscribeToCustomPricingChanges subscribes the given channel to receive
@@ -83,15 +98,8 @@ func (a *Accesses) customPricingHasChanged() bool {
 		return false
 	}
 
-	// describe parameters by which we determine whether or not custom
-	// pricing settings have changed
-	encodeCustomPricing := func(cp *models.CustomPricing) string {
-		return fmt.Sprintf("%s:%s:%s:%s:%s:%s:%s:%s", cp.CustomPricesEnabled, cp.CPU, cp.SpotCPU,
-			cp.RAM, cp.SpotRAM, cp.GPU, cp.Storage, cp.CurrencyCode)
-	}
-
 	// compare cached custom pricing parameters with current values
-	cpStr := encodeCustomPricing(customPricing)
+	cpStr := etlPricingFingerprint(customPricing)
 	cpStrCached := ""
 	val, found := a.SettingsCache.Get(CustomPricingSetting)
 	if !found {

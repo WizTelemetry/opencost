@@ -90,7 +90,7 @@ These are backed by the Cobra/Viper command setup.
 | `MAX_QUERY_CONCURRENCY` | `5` | Max concurrent Prometheus queries. | Tuning load against Prometheus. | If `<=0`, falls back to `GOMAXPROCS`. Keep modest for shared Prometheus. |
 | `KUBECOST_SCRAPE_INTERVAL` | `0` | Optional scrape interval override. | Prometheus scrape interval is known and should be explicit. | Use duration strings such as `60s`. |
 | `KUBECOST_JOB_NAME` | `kubecost` | Prometheus job label value for OpenCost metrics. | Your scrape job uses a different name. | Keep aligned with Prometheus scrape config. |
-| `PROM_CLUSTER_ID_LABEL` | `cluster_id` | Prometheus label used for cluster ID. | Your metrics use a different cluster label. | Must match the labels in Prometheus. |
+| `PROM_CLUSTER_ID_LABEL` | `cluster_id` | Preferred Prometheus label used for cluster ID. | Your metrics consistently use a different cluster label. | At startup OpenCost verifies KSM/kubelet coverage and falls back to `cluster` when the preferred label is absent from those sources. |
 | `CURRENT_CLUSTER_ID_FILTER_ENABLED` | `false` | Adds a current-cluster filter to Prometheus queries. | Prometheus contains data from multiple clusters. | Requires `CLUSTER_ID` and `PROM_CLUSTER_ID_LABEL` to be correct. |
 | `PROMETHEUS_HEADER_X_SCOPE_ORGID` | empty | Adds `X-Scope-OrgID` for Mimir/Cortex tenant routing. | Querying multi-tenant Mimir/Cortex. | Set to the tenant/org ID. |
 | `PROMETHEUS_RETRY_ON_RATE_LIMIT` | `true` | Retries Prometheus requests on rate-limit responses. | Using rate-limited Prometheus-compatible backends. | Keep enabled for AMP and similar services. |
@@ -116,6 +116,24 @@ For more detail, see [API Performance Environment Variables](api-performance-env
 | `OPENCOST_HISTORICAL_QUERY_CACHE_TTL_SECONDS` | `300` | Response cache TTL for historical windows. | Historical API views are used frequently. | `600` is a reasonable dashboard value. |
 | `OPENCOST_ALLOCATION_STEP_CACHE_TTL_SECONDS` | `30` | Internal realtime allocation step cache TTL. | Allocation-derived endpoints are repeatedly queried. | Pair with realtime query cache TTL. |
 | `OPENCOST_ALLOCATION_HISTORICAL_STEP_CACHE_TTL_SECONDS` | `600` | Internal historical allocation step cache TTL. | Historical allocation queries are repeated. | `600` to `1800` is usually safe if data backfill is uncommon. |
+| `OPENCOST_ASSET_STEP_CACHE_TTL_SECONDS` | `30` | Internal realtime asset step cache TTL. | `includeIdle=true` queries repeatedly need asset calculations. | Pair with the allocation step TTL for overview dashboards. |
+| `OPENCOST_ASSET_HISTORICAL_STEP_CACHE_TTL_SECONDS` | `600` | Internal historical asset step cache TTL. | Historical asset queries are repeated. | `600` to `1800` is usually safe if data backfill is uncommon. |
+| `OPENCOST_ETL_ENABLED` | `false` | Enables persistent allocation bucket precomputation. | API cold requests remain expensive after caching improvements. | Requires writable persistent storage for best results. Assets stay live because rolling-window costs are not additive. |
+| `OPENCOST_ETL_STORAGE_DIR` | `/var/configs/costwise-etl` | Directory containing immutable ETL bucket files. | ETL is enabled. | Use a PVC-backed directory in production. |
+| `OPENCOST_ETL_RESOLUTION_SECONDS` | `3600` | Base ETL bucket duration. | Tuning boundary precision versus Prometheus load. | Smaller buckets increase build and storage cost. |
+| `OPENCOST_ETL_HOURLY_STORE_DURATION_HOURS` | `168` | Hourly bucket retention and cleanup age. | Recent arbitrary windows need finer ETL coverage. | Seven days is the dashboard-oriented default. |
+| `OPENCOST_ETL_DAILY_STORE_DURATION_DAYS` | `30` | Daily bucket retention and cleanup age. | Longer historical dashboard ranges are common. | Daily buckets reduce ETL file count and merge cost. |
+| `OPENCOST_ETL_INTERVAL_SECONDS` | `300` | Background ETL run interval. | Tuning freshness and Prometheus pressure. | Keep compatible with Prometheus scrape/data delay. |
+| `OPENCOST_ETL_STARTUP_DELAY_SECONDS` | `30` | Delay before the first ETL run. | Prometheus/pricing initialization is slow. | `10` to `60` seconds is typical. |
+| `OPENCOST_ETL_QUERY_CONCURRENCY` | `2` | Concurrent ETL bucket builds. | Prometheus has spare query capacity. | Do not raise aggressively; each build fans out many PromQL queries. |
+| `OPENCOST_ETL_MAX_HOURLY_BUCKETS_PER_RUN` | `48` | Hourly bucket build limit per run. | Controlling first-run backfill load. | Remaining buckets are built incrementally. |
+| `OPENCOST_ETL_MAX_DAILY_BUCKETS_PER_RUN` | `7` | Daily bucket build limit per run. | Controlling daily backfill load. | Remaining buckets are built incrementally. |
+| `OPENCOST_ETL_REFRESH_HOURLY_BUCKETS` | `2` | Maximum stale hourly buckets rebuilt each run. | Prometheus receives late data. | Missing buckets are built first; more refreshes increase load. |
+| `OPENCOST_ETL_REFRESH_DAILY_BUCKETS` | `1` | Maximum stale daily buckets rebuilt each run. | Late data affects completed days. | Missing buckets are built first; more refreshes increase load. |
+| `OPENCOST_ETL_LATE_DATA_HOURLY_LOOKBACK_HOURS` | `48` | Recent hourly range eligible for rolling rebuilds. | Prometheus backfills data later than a few hours. | Set `0` to disable hourly late-data refreshes. |
+| `OPENCOST_ETL_LATE_DATA_DAILY_LOOKBACK_DAYS` | `3` | Recent daily range eligible for rolling rebuilds. | Completed daily buckets receive late samples. | Set `0` to disable daily late-data refreshes. |
+| `OPENCOST_ETL_LATE_DATA_REFRESH_INTERVAL_SECONDS` | `1800` | Minimum bucket age before another refresh. | Balancing freshness against Prometheus load. | `0` allows eligible buckets to refresh on every worker run. |
+| `OPENCOST_ETL_MINIMUM_COVERAGE_PERCENT` | `50` | Minimum ETL coverage before composing ETL with live ranges. | Avoiding overhead from tiny partial caches. | Lower values use partial ETL sooner. |
 | `OPENCOST_CACHE_WARMER_ENABLED` | `false` | Enables background warming of common read-only API responses. | First dashboard request is slow. | Recommended `true` for frontend-heavy deployments. |
 | `OPENCOST_CACHE_WARMER_INTERVAL_SECONDS` | `300` | Interval between cache warmer runs. | Cache warmer is enabled. | Keep less than or equal to realtime response cache TTL. |
 | `OPENCOST_CACHE_WARMER_STARTUP_DELAY_SECONDS` | `30` | Delay before first cache warm after startup. | Startup dependencies need time to become ready. | Use `5` to `30`. Longer if Prometheus is slow at startup. |
@@ -281,8 +299,14 @@ OPENCOST_REALTIME_QUERY_CACHE_TTL_SECONDS=300
 OPENCOST_HISTORICAL_QUERY_CACHE_TTL_SECONDS=600
 OPENCOST_ALLOCATION_STEP_CACHE_TTL_SECONDS=300
 OPENCOST_ALLOCATION_HISTORICAL_STEP_CACHE_TTL_SECONDS=600
+OPENCOST_ASSET_STEP_CACHE_TTL_SECONDS=300
+OPENCOST_ASSET_HISTORICAL_STEP_CACHE_TTL_SECONDS=600
+OPENCOST_ETL_ENABLED=true
+OPENCOST_ETL_STORAGE_DIR=/mnt/export/etl
+OPENCOST_ETL_HOURLY_STORE_DURATION_HOURS=168
+OPENCOST_ETL_DAILY_STORE_DURATION_DAYS=30
 OPENCOST_CACHE_WARMER_ENABLED=true
-OPENCOST_CACHE_WARMER_INTERVAL_SECONDS=300
+OPENCOST_CACHE_WARMER_INTERVAL_SECONDS=240
 OPENCOST_CACHE_WARMER_STARTUP_DELAY_SECONDS=30
 ```
 

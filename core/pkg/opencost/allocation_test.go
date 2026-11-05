@@ -3843,6 +3843,39 @@ func TestRawAllocationOnlyData_SanitizeNaN(t *testing.T) {
 
 }
 
+func TestRawAllocationOnlyDataCloneDoesNotShareGPUUsageMax(t *testing.T) {
+	gpuUsageMax := 2.5
+	raw := &RawAllocationOnlyData{
+		CPUCoreUsageMax:  1,
+		RAMBytesUsageMax: 2,
+		GPUUsageMax:      &gpuUsageMax,
+	}
+
+	clone := raw.Clone()
+	*clone.GPUUsageMax = 9
+
+	if *raw.GPUUsageMax != 2.5 {
+		t.Fatalf("clone mutated original GPU usage max: want 2.5, got %v", *raw.GPUUsageMax)
+	}
+}
+
+func TestAllocationSetClonePreservesWarnings(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	allocations := NewAllocationSet(start, end)
+	allocations.Warnings = []string{"warning"}
+
+	clone := allocations.Clone()
+	if len(clone.Warnings) != 1 || clone.Warnings[0] != "warning" {
+		t.Fatalf("clone did not preserve warnings: %v", clone.Warnings)
+	}
+
+	clone.Warnings[0] = "changed"
+	if allocations.Warnings[0] != "warning" {
+		t.Fatal("clone shares the warnings slice with the original")
+	}
+}
+
 func getMockRawAllocationOnlyData(f float64) *RawAllocationOnlyData {
 	return &RawAllocationOnlyData{
 		CPUCoreUsageMax:  f,

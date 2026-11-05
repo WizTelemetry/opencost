@@ -2913,7 +2913,7 @@ func (as *AssetSet) Clone() *AssetSet {
 	}
 
 	if as.Warnings != nil {
-		warnings := make([]string, len(as.Warnings))
+		warnings = make([]string, len(as.Warnings))
 		copy(warnings, as.Warnings)
 	} else {
 		warnings = nil

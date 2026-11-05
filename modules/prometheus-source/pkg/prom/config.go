@@ -36,6 +36,18 @@ type OpenCostPrometheusConfig struct {
 	DataResolutionMinutes int
 }
 
+// SetEffectiveClusterLabel updates the query and result-parsing cluster label.
+// ClusterFilter must be rebuilt as well so current-cluster filtering remains
+// aligned with the selected source label.
+func (ocpc *OpenCostPrometheusConfig) SetEffectiveClusterLabel(clusterLabel string) {
+	if clusterLabel == "" {
+		return
+	}
+
+	ocpc.ClusterLabel = clusterLabel
+	ocpc.ClusterFilter = env.GetPromClusterFilterForLabel(clusterLabel)
+}
+
 func (ocpc *OpenCostPrometheusConfig) IsRateLimitRetryEnabled() bool {
 	return ocpc.ClientConfig.RateLimitRetryOpts != nil
 }

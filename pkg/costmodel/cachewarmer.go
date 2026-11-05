@@ -1,6 +1,7 @@
 package costmodel
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,8 @@ import (
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/util/interval"
 )
+
+type cacheWarmerContextKey struct{}
 
 const (
 	cacheWarmerEnabledEnvVar      = "OPENCOST_CACHE_WARMER_ENABLED"
@@ -100,9 +103,25 @@ func (cw *CacheWarmer) Stop() bool {
 
 // warmAll iterates all configured endpoints and warms each one.
 func (cw *CacheWarmer) warmAll() {
+	cw.flushStepCaches()
 	for _, endpoint := range cw.endpoints {
 		cw.warmEndpoint(endpoint)
 	}
+}
+
+func (cw *CacheWarmer) flushStepCaches() {
+	if cw == nil {
+		return
+	}
+
+	cw.mu.Lock()
+	a := cw.accesses
+	cw.mu.Unlock()
+
+	if a == nil || a.Model == nil {
+		return
+	}
+	a.Model.flushStepCaches()
 }
 
 // warmEndpoint warms a single endpoint by calling the handler directly.
@@ -132,6 +151,10 @@ func (cw *CacheWarmer) warmEndpoint(endpoint string) {
 		RawQuery: rawQuery,
 	}
 	req := httptest.NewRequest(http.MethodGet, targetURL.String(), nil)
+	req = cw.accesses.withQueryCacheEpoch(req)
+	// Recompute on every run so the step caches are refreshed as well; the
+	// handlers still write the fresh response back into the query cache.
+	req = req.WithContext(context.WithValue(req.Context(), cacheWarmerContextKey{}, true))
 	rr := httptest.NewRecorder()
 
 	// Dispatch to the appropriate handler
@@ -146,6 +169,14 @@ func (cw *CacheWarmer) warmEndpoint(endpoint string) {
 	duration := time.Since(start)
 	status := rr.Code
 	log.Infof("CacheWarmer: warmed %s status=%d duration=%v", endpoint, status, duration)
+}
+
+func isCacheWarmerRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	bypass, _ := r.Context().Value(cacheWarmerContextKey{}).(bool)
+	return bypass
 }
 
 // warmHandlerForPath returns the handler for the given path prefix.
