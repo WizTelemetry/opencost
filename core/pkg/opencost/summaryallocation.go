@@ -22,32 +22,33 @@ import (
 // within which it is defined, as opposed to the Start and End times). That
 // context must be provided by a SummaryAllocationSet.
 type SummaryAllocation struct {
-	Name                   string                `json:"name"`
-	Properties             *AllocationProperties `json:"-"`
-	Start                  time.Time             `json:"start"`
-	End                    time.Time             `json:"end"`
-	CPUCoreRequestAverage  float64               `json:"cpuCoreRequestAverage"`
-	CPUCoreLimitAverage    float64               `json:"cpuCoreLimitAverage"`
-	CPUCoreUsageAverage    float64               `json:"cpuCoreUsageAverage"`
-	CPUCost                float64               `json:"cpuCost"`
-	CPUCostIdle            float64               `json:"cpuCostIdle"`
-	GPURequestAverage      *float64              `json:"gpuRequestAverage"`
-	GPUUsageAverage        *float64              `json:"gpuUsageAverage"`
-	GPUCost                float64               `json:"gpuCost"`
-	GPUCostIdle            float64               `json:"gpuCostIdle"`
-	NetworkCost            float64               `json:"networkCost"`
-	LoadBalancerCost       float64               `json:"loadBalancerCost"`
-	PVCost                 float64               `json:"pvCost"`
-	RAMBytesRequestAverage float64               `json:"ramByteRequestAverage"`
-	RAMBytesLimitAverage   float64               `json:"ramByteLimitAverage"`
-	RAMBytesUsageAverage   float64               `json:"ramByteUsageAverage"`
-	RAMCost                float64               `json:"ramCost"`
-	RAMCostIdle            float64               `json:"ramCostIdle"`
-	SharedCost             float64               `json:"sharedCost"`
-	ExternalCost           float64               `json:"externalCost"`
-	Share                  bool                  `json:"-"`
-	UnmountedPVCost        float64               `json:"-"`
-	Efficiency             float64               `json:"efficiency"`
+	requestEfficiencyStats *requestEfficiencyStats `json:"-"`
+	Name                   string                  `json:"name"`
+	Properties             *AllocationProperties   `json:"-"`
+	Start                  time.Time               `json:"start"`
+	End                    time.Time               `json:"end"`
+	CPUCoreRequestAverage  float64                 `json:"cpuCoreRequestAverage"`
+	CPUCoreLimitAverage    float64                 `json:"cpuCoreLimitAverage"`
+	CPUCoreUsageAverage    float64                 `json:"cpuCoreUsageAverage"`
+	CPUCost                float64                 `json:"cpuCost"`
+	CPUCostIdle            float64                 `json:"cpuCostIdle"`
+	GPURequestAverage      *float64                `json:"gpuRequestAverage"`
+	GPUUsageAverage        *float64                `json:"gpuUsageAverage"`
+	GPUCost                float64                 `json:"gpuCost"`
+	GPUCostIdle            float64                 `json:"gpuCostIdle"`
+	NetworkCost            float64                 `json:"networkCost"`
+	LoadBalancerCost       float64                 `json:"loadBalancerCost"`
+	PVCost                 float64                 `json:"pvCost"`
+	RAMBytesRequestAverage float64                 `json:"ramByteRequestAverage"`
+	RAMBytesLimitAverage   float64                 `json:"ramByteLimitAverage"`
+	RAMBytesUsageAverage   float64                 `json:"ramByteUsageAverage"`
+	RAMCost                float64                 `json:"ramCost"`
+	RAMCostIdle            float64                 `json:"ramCostIdle"`
+	SharedCost             float64                 `json:"sharedCost"`
+	ExternalCost           float64                 `json:"externalCost"`
+	Share                  bool                    `json:"-"`
+	UnmountedPVCost        float64                 `json:"-"`
+	Efficiency             float64                 `json:"efficiency"`
 }
 
 // NewSummaryAllocation converts an Allocation to a SummaryAllocation by
@@ -105,6 +106,13 @@ func NewSummaryAllocation(alloc *Allocation, reconcile, reconcileNetwork bool) *
 		sa.NetworkCost -= alloc.NetworkCostAdjustment
 	}
 
+	stats := *alloc.requestStats()
+	if !reconcile {
+		stats.cpuCost -= stats.cpuAdjustment
+		stats.ramCost -= stats.ramAdjustment
+	}
+	sa.requestEfficiencyStats = &stats
+
 	// If the allocation is unmounted, set UnmountedPVCost to the full PVCost.
 	if sa.IsUnmounted() {
 		sa.UnmountedPVCost = sa.PVCost
@@ -120,6 +128,10 @@ func (sa *SummaryAllocation) Add(that *SummaryAllocation) error {
 	if sa == nil || that == nil {
 		return errors.New("cannot Add a nil SummaryAllocation")
 	}
+
+	stats := *sa.requestStats()
+	stats.add(that.requestStats())
+	sa.requestEfficiencyStats = &stats
 
 	// Once Added, a SummaryAllocation has no Properties. This saves us from
 	// having to compute the intersection of two sets of Properties, which is
@@ -236,7 +248,13 @@ func (sa *SummaryAllocation) Add(that *SummaryAllocation) error {
 
 // Clone copies the SummaryAllocation and returns the copy
 func (sa *SummaryAllocation) Clone() *SummaryAllocation {
+	var stats *requestEfficiencyStats
+	if sa.requestEfficiencyStats != nil {
+		copy := *sa.requestEfficiencyStats
+		stats = &copy
+	}
 	return &SummaryAllocation{
+		requestEfficiencyStats: stats,
 		Name:                   sa.Name,
 		Properties:             sa.Properties.Clone(),
 		Start:                  sa.Start,
@@ -970,6 +988,7 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 
 				cpuCoeff, gpuCoeff, ramCoeff := ComputeIdleCoefficients(options.ShareIdle, key, sa.CPUCost, sa.GPUCost, sa.RAMCost, allocTotals)
 
+				sa.addSharedIdleToRequestStats(idle.CPUCost*cpuCoeff, idle.RAMCost*ramCoeff)
 				sa.CPUCost += idle.CPUCost * cpuCoeff
 				sa.GPUCost += idle.GPUCost * gpuCoeff
 				sa.RAMCost += idle.RAMCost * ramCoeff
@@ -1035,6 +1054,7 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 
 				cpuCoeff, gpuCoeff, ramCoeff := ComputeIdleCoefficients(options.ShareIdle, key, sa.CPUCost, sa.GPUCost, sa.RAMCost, allocTotals)
 
+				sa.addSharedIdleToRequestStats(idle.CPUCost*cpuCoeff, idle.RAMCost*ramCoeff)
 				sa.CPUCost += idle.CPUCost * cpuCoeff
 				sa.GPUCost += idle.GPUCost * gpuCoeff
 				sa.RAMCost += idle.RAMCost * ramCoeff

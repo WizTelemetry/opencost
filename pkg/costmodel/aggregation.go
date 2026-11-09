@@ -207,7 +207,7 @@ func trimAllocationSetRangeToRequestWindow(asr *opencost.AllocationSetRange, req
 // ComputeAllocationHandlerSummary computes a summarized AllocationSetRange.
 // @Summary      查询成本分配摘要
 // @Tags         Allocation
-// @Description  返回成本分配摘要数据，支持窗口、聚合、过滤、累积和 CSV 导出。
+// @Description  返回成本分配摘要数据，支持窗口、聚合、过滤、累积和 CSV 导出。JSON efficiency 对当前行中 request 大于零的 CPU 和内存按成本加权；无有效成本权重时为 null。汇总时按原始 allocation 查询批次排除对应 request 为零的资源；历史数据的粒度受 ETL 桶限制。requestEfficiencyMetadata 为可选 v1 汇总状态，CPU 数值单位为 core-minutes，内存数值单位为 byte-minutes，成本使用当前币种；旧客户端可忽略。
 // @Param        window        query  string  true   "时间窗口。必填。示例：window=7d、window=today、window=2026-05-01T00:00:00Z,2026-05-08T00:00:00Z"
 // @Param        aggregate     query  string  false  "聚合维度，多个值使用英文逗号分隔。示例：aggregate=namespace,label:app"
 // @Param        accumulate    query  string  false  "累计粒度。支持 true、all、hour、day、week、month。"
@@ -472,7 +472,7 @@ type SummaryAllocationToplineItem struct {
 	RAMCostIdle            float64   `json:"ramCostIdle"`
 	SharedCost             float64   `json:"sharedCost"`
 	ExternalCost           float64   `json:"externalCost"`
-	Efficiency             float64   `json:"efficiency"`
+	Efficiency             *float64  `json:"efficiency"`
 }
 
 // ComputeAllocationHandlerSummaryTopline
@@ -625,29 +625,8 @@ func summarizeSummaryAllocationSet(sas *opencost.SummaryAllocationSet) *opencost
 		}
 
 		if total == nil {
-			total = &opencost.SummaryAllocation{
-				Name:                   "total",
-				Start:                  sa.Start,
-				End:                    sa.End,
-				CPUCoreRequestAverage:  sa.CPUCoreRequestAverage,
-				CPUCoreUsageAverage:    sa.CPUCoreUsageAverage,
-				CPUCost:                sa.CPUCost,
-				CPUCostIdle:            sa.CPUCostIdle,
-				GPURequestAverage:      sa.GPURequestAverage,
-				GPUUsageAverage:        sa.GPUUsageAverage,
-				GPUCost:                sa.GPUCost,
-				GPUCostIdle:            sa.GPUCostIdle,
-				NetworkCost:            sa.NetworkCost,
-				LoadBalancerCost:       sa.LoadBalancerCost,
-				PVCost:                 sa.PVCost,
-				RAMBytesRequestAverage: sa.RAMBytesRequestAverage,
-				RAMBytesUsageAverage:   sa.RAMBytesUsageAverage,
-				RAMCost:                sa.RAMCost,
-				RAMCostIdle:            sa.RAMCostIdle,
-				SharedCost:             sa.SharedCost,
-				ExternalCost:           sa.ExternalCost,
-				Efficiency:             sa.Efficiency,
-			}
+			total = sa.Clone()
+			total.Name = "total"
 			continue
 		}
 
@@ -696,14 +675,14 @@ func summaryAllocationToToplineItem(sa *opencost.SummaryAllocation) *SummaryAllo
 		RAMCostIdle:            sa.RAMCostIdle,
 		SharedCost:             sa.SharedCost,
 		ExternalCost:           sa.ExternalCost,
-		Efficiency:             sa.Efficiency,
+		Efficiency:             sa.RequestEfficiency(),
 	}
 }
 
 // ComputeAllocationHandler computes an AllocationSetRange from the CostModel.
 // @Summary      查询成本分配明细
 // @Tags         Allocation
-// @Description  返回成本分配明细数据，支持聚合、过滤、idle、共享 idle、比例资产成本和 CSV 导出。
+// @Description  返回成本分配明细数据，支持聚合、过滤、idle、共享 idle、比例资产成本和 CSV 导出。JSON cpuEfficiency 和 ramEfficiency 在对应 request 为零时为 null，否则为 usage/request；totalEfficiency 仅按当前行中 request 大于零的资源成本加权，无有效成本权重时为 null。汇总时按原始 allocation 查询批次排除对应 request 为零的资源；历史数据的粒度受 ETL 桶限制。requestEfficiencyMetadata 为可选 v1 汇总状态，CPU 数值单位为 core-minutes，内存数值单位为 byte-minutes，成本使用当前币种；旧客户端可忽略。
 // @Param        window                           query  string  true   "时间窗口。必填。"
 // @Param        aggregate                        query  string  false  "聚合维度，多个值使用英文逗号分隔。"
 // @Param        includeIdle                      query  bool    false  "是否包含 idle 成本。"

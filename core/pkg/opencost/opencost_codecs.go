@@ -13,6 +13,7 @@ package opencost
 
 import (
 	"fmt"
+	util "github.com/opencost/opencost/core/pkg/util"
 	"io"
 	"iter"
 	"os"
@@ -21,8 +22,6 @@ import (
 	"sync"
 	"time"
 	"unsafe"
-
-	util "github.com/opencost/opencost/core/pkg/util"
 )
 
 const (
@@ -38,12 +37,6 @@ const (
 )
 
 const (
-	// CloudCostCodecVersion is used for any resources listed in the CloudCost version set
-	CloudCostCodecVersion uint8 = 3
-
-	// NetworkInsightCodecVersion is used for any resources listed in the NetworkInsight version set
-	NetworkInsightCodecVersion uint8 = 1
-
 	// DefaultCodecVersion is used for any resources listed in the Default version set
 	DefaultCodecVersion uint8 = 18
 
@@ -51,7 +44,13 @@ const (
 	AssetsCodecVersion uint8 = 21
 
 	// AllocationCodecVersion is used for any resources listed in the Allocation version set
-	AllocationCodecVersion uint8 = 25
+	AllocationCodecVersion uint8 = 26
+
+	// CloudCostCodecVersion is used for any resources listed in the CloudCost version set
+	CloudCostCodecVersion uint8 = 3
+
+	// NetworkInsightCodecVersion is used for any resources listed in the NetworkInsight version set
+	NetworkInsightCodecVersion uint8 = 1
 )
 
 //--------------------------------------------------------------------------
@@ -118,37 +117,38 @@ func BingenFileBackedStringTableDir() string {
 // Generated type map for resolving interface implementations to
 // to concrete types
 var typeMap map[string]reflect.Type = map[string]reflect.Type{
-	"Allocation":            reflect.TypeFor[Allocation](),
-	"AllocationProperties":  reflect.TypeFor[AllocationProperties](),
-	"AllocationSet":         reflect.TypeFor[AllocationSet](),
-	"AllocationSetRange":    reflect.TypeFor[AllocationSetRange](),
-	"Any":                   reflect.TypeFor[Any](),
-	"AssetProperties":       reflect.TypeFor[AssetProperties](),
-	"AssetSet":              reflect.TypeFor[AssetSet](),
-	"AssetSetRange":         reflect.TypeFor[AssetSetRange](),
-	"Breakdown":             reflect.TypeFor[Breakdown](),
-	"Cloud":                 reflect.TypeFor[Cloud](),
-	"CloudCost":             reflect.TypeFor[CloudCost](),
-	"CloudCostProperties":   reflect.TypeFor[CloudCostProperties](),
-	"CloudCostSet":          reflect.TypeFor[CloudCostSet](),
-	"CloudCostSetRange":     reflect.TypeFor[CloudCostSetRange](),
-	"ClusterManagement":     reflect.TypeFor[ClusterManagement](),
-	"CostMetric":            reflect.TypeFor[CostMetric](),
-	"Disk":                  reflect.TypeFor[Disk](),
-	"GPUAllocation":         reflect.TypeFor[GPUAllocation](),
-	"LbAllocation":          reflect.TypeFor[LbAllocation](),
-	"LoadBalancer":          reflect.TypeFor[LoadBalancer](),
-	"Network":               reflect.TypeFor[Network](),
-	"NetworkDetail":         reflect.TypeFor[NetworkDetail](),
-	"NetworkInsight":        reflect.TypeFor[NetworkInsight](),
-	"NetworkInsightSet":     reflect.TypeFor[NetworkInsightSet](),
-	"Node":                  reflect.TypeFor[Node](),
-	"NodeOverhead":          reflect.TypeFor[NodeOverhead](),
-	"PVAllocation":          reflect.TypeFor[PVAllocation](),
-	"PVKey":                 reflect.TypeFor[PVKey](),
-	"RawAllocationOnlyData": reflect.TypeFor[RawAllocationOnlyData](),
-	"SharedAsset":           reflect.TypeFor[SharedAsset](),
-	"Window":                reflect.TypeFor[Window](),
+	"Allocation":             reflect.TypeFor[Allocation](),
+	"AllocationProperties":   reflect.TypeFor[AllocationProperties](),
+	"AllocationSet":          reflect.TypeFor[AllocationSet](),
+	"AllocationSetRange":     reflect.TypeFor[AllocationSetRange](),
+	"Any":                    reflect.TypeFor[Any](),
+	"AssetProperties":        reflect.TypeFor[AssetProperties](),
+	"AssetSet":               reflect.TypeFor[AssetSet](),
+	"AssetSetRange":          reflect.TypeFor[AssetSetRange](),
+	"Breakdown":              reflect.TypeFor[Breakdown](),
+	"Cloud":                  reflect.TypeFor[Cloud](),
+	"CloudCost":              reflect.TypeFor[CloudCost](),
+	"CloudCostProperties":    reflect.TypeFor[CloudCostProperties](),
+	"CloudCostSet":           reflect.TypeFor[CloudCostSet](),
+	"CloudCostSetRange":      reflect.TypeFor[CloudCostSetRange](),
+	"ClusterManagement":      reflect.TypeFor[ClusterManagement](),
+	"CostMetric":             reflect.TypeFor[CostMetric](),
+	"Disk":                   reflect.TypeFor[Disk](),
+	"GPUAllocation":          reflect.TypeFor[GPUAllocation](),
+	"LbAllocation":           reflect.TypeFor[LbAllocation](),
+	"LoadBalancer":           reflect.TypeFor[LoadBalancer](),
+	"Network":                reflect.TypeFor[Network](),
+	"NetworkDetail":          reflect.TypeFor[NetworkDetail](),
+	"NetworkInsight":         reflect.TypeFor[NetworkInsight](),
+	"NetworkInsightSet":      reflect.TypeFor[NetworkInsightSet](),
+	"Node":                   reflect.TypeFor[Node](),
+	"NodeOverhead":           reflect.TypeFor[NodeOverhead](),
+	"PVAllocation":           reflect.TypeFor[PVAllocation](),
+	"PVKey":                  reflect.TypeFor[PVKey](),
+	"RawAllocationOnlyData":  reflect.TypeFor[RawAllocationOnlyData](),
+	"SharedAsset":            reflect.TypeFor[SharedAsset](),
+	"Window":                 reflect.TypeFor[Window](),
+	"requestEfficiencyStats": reflect.TypeFor[requestEfficiencyStats](),
 }
 
 //--------------------------------------------------------------------------
@@ -884,6 +884,20 @@ func (target *Allocation) MarshalBinaryWithContext(ctx *EncodingContext) (err er
 	buff.WriteFloat64(target.RAMBytesLimitAverage)         // write float64
 	buff.WriteFloat64(target.NetworkNatGatewayEgressCost)  // write float64
 	buff.WriteFloat64(target.NetworkNatGatewayIngressCost) // write float64
+	if target.requestEfficiencyStats == nil {
+		buff.WriteUInt8(uint8(0)) // write nil byte
+	} else {
+		buff.WriteUInt8(uint8(1)) // write non-nil byte
+
+		// --- [begin][write][struct](requestEfficiencyStats) ---
+		buff.WriteInt(0) // [compatibility, unused]
+		errJ := target.requestEfficiencyStats.MarshalBinaryWithContext(ctx)
+		if errJ != nil {
+			return errJ
+		}
+		// --- [end][write][struct](requestEfficiencyStats) ---
+
+	}
 	return nil
 }
 
@@ -1264,6 +1278,27 @@ func (target *Allocation) UnmarshalBinaryWithContext(ctx *DecodingContext) (err 
 
 	} else {
 		target.NetworkNatGatewayIngressCost = float64(0) // default
+	}
+
+	// field version check
+	if uint8(26) <= version {
+		if buff.ReadUInt8() == uint8(0) {
+			target.requestEfficiencyStats = nil
+		} else {
+			// --- [begin][read][struct](requestEfficiencyStats) ---
+			rrr := &requestEfficiencyStats{}
+			buff.ReadInt() // [compatibility, unused]
+			errJ := rrr.UnmarshalBinaryWithContext(ctx)
+			if errJ != nil {
+				return errJ
+			}
+			target.requestEfficiencyStats = rrr
+			// --- [end][read][struct](requestEfficiencyStats) ---
+
+		}
+	} else {
+		target.requestEfficiencyStats = nil
+
 	}
 
 	// execute migration func if version delta detected
@@ -9101,5 +9136,132 @@ func (target *Window) UnmarshalBinaryWithContext(ctx *DecodingContext) (err erro
 		// --- [end][read][reference](time.Time) ---
 
 	}
+	return nil
+}
+
+//--------------------------------------------------------------------------
+//  requestEfficiencyStats
+//--------------------------------------------------------------------------
+
+// MarshalBinary serializes the internal properties of this requestEfficiencyStats instance
+// into a byte array
+func (target *requestEfficiencyStats) MarshalBinary() (data []byte, err error) {
+	ctx := &EncodingContext{
+		Buffer: util.NewBuffer(),
+		Table:  nil,
+	}
+
+	e := target.MarshalBinaryWithContext(ctx)
+	if e != nil {
+		return nil, e
+	}
+
+	encBytes := ctx.Buffer.Bytes()
+	return encBytes, nil
+}
+
+// MarshalBinaryWithContext serializes the internal properties of this requestEfficiencyStats instance
+// into a byte array leveraging a predefined context.
+func (target *requestEfficiencyStats) MarshalBinaryWithContext(ctx *EncodingContext) (err error) {
+	// panics are recovered and propagated as errors
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = e
+			} else if s, ok := r.(string); ok {
+				err = fmt.Errorf("Unexpected panic: %s", s)
+			} else {
+				err = fmt.Errorf("Unexpected panic: %+v", r)
+			}
+		}
+	}()
+
+	buff := ctx.Buffer
+	buff.WriteUInt8(AllocationCodecVersion) // version
+
+	buff.WriteFloat64(target.cpuRequest)    // write float64
+	buff.WriteFloat64(target.cpuUsage)      // write float64
+	buff.WriteFloat64(target.cpuCost)       // write float64
+	buff.WriteFloat64(target.cpuAdjustment) // write float64
+	buff.WriteFloat64(target.ramRequest)    // write float64
+	buff.WriteFloat64(target.ramUsage)      // write float64
+	buff.WriteFloat64(target.ramCost)       // write float64
+	buff.WriteFloat64(target.ramAdjustment) // write float64
+	return nil
+}
+
+// UnmarshalBinary uses the data passed byte array to set all the internal properties of
+// the requestEfficiencyStats type
+func (target *requestEfficiencyStats) UnmarshalBinary(data []byte) error {
+	ctx := NewDecodingContextFromBytes(data)
+	defer ctx.Close()
+	err := target.UnmarshalBinaryWithContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// UnmarshalBinaryFromReader uses the io.Reader data to set all the internal properties of
+// the requestEfficiencyStats type
+func (target *requestEfficiencyStats) UnmarshalBinaryFromReader(reader io.Reader) error {
+	ctx := NewDecodingContextFromReader(reader)
+	defer ctx.Close()
+	err := target.UnmarshalBinaryWithContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// UnmarshalBinaryWithContext uses the context containing a string table and binary buffer to set all the internal properties of
+// the requestEfficiencyStats type
+func (target *requestEfficiencyStats) UnmarshalBinaryWithContext(ctx *DecodingContext) (err error) {
+	// panics are recovered and propagated as errors
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = e
+			} else if s, ok := r.(string); ok {
+				err = fmt.Errorf("Unexpected panic: %s", s)
+			} else {
+				err = fmt.Errorf("Unexpected panic: %+v", r)
+			}
+		}
+	}()
+
+	buff := ctx.Buffer
+	version := buff.ReadUInt8()
+
+	if version > AllocationCodecVersion {
+		return fmt.Errorf("Invalid Version Unmarshaling requestEfficiencyStats. Expected %d or less, got %d", AllocationCodecVersion, version)
+	}
+
+	a := buff.ReadFloat64() // read float64
+	target.cpuRequest = a
+
+	b := buff.ReadFloat64() // read float64
+	target.cpuUsage = b
+
+	c := buff.ReadFloat64() // read float64
+	target.cpuCost = c
+
+	d := buff.ReadFloat64() // read float64
+	target.cpuAdjustment = d
+
+	e := buff.ReadFloat64() // read float64
+	target.ramRequest = e
+
+	f := buff.ReadFloat64() // read float64
+	target.ramUsage = f
+
+	g := buff.ReadFloat64() // read float64
+	target.ramCost = g
+
+	h := buff.ReadFloat64() // read float64
+	target.ramAdjustment = h
+
 	return nil
 }

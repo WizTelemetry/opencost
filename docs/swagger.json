@@ -44,7 +44,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/allocation": {
       "get": {
-        "description": "返回成本分配明细数据，支持聚合、过滤、idle、共享 idle、比例资产成本和 CSV 导出。",
+        "description": "返回成本分配明细数据，支持聚合、过滤、idle、共享 idle、比例资产成本和 CSV 导出。JSON cpuEfficiency 和 ramEfficiency 在对应 request 为零时为 null，否则为 usage/request；totalEfficiency 仅按当前行中 request 大于零的资源成本加权，无有效成本权重时为 null。汇总时按原始 allocation 查询批次排除对应 request 为零的资源；历史数据的粒度受 ETL 桶限制。requestEfficiencyMetadata 为可选 v1 汇总状态，CPU 数值单位为 core-minutes，内存数值单位为 byte-minutes，成本使用当前币种；旧客户端可忽略。",
         "tags": [
           "Allocation"
         ],
@@ -269,7 +269,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/allocation/compute": {
       "get": {
-        "description": "返回成本分配明细数据，支持聚合、过滤、idle、共享 idle、比例资产成本和 CSV 导出。",
+        "description": "返回成本分配明细数据，支持聚合、过滤、idle、共享 idle、比例资产成本和 CSV 导出。JSON cpuEfficiency 和 ramEfficiency 在对应 request 为零时为 null，否则为 usage/request；totalEfficiency 仅按当前行中 request 大于零的资源成本加权，无有效成本权重时为 null。汇总时按原始 allocation 查询批次排除对应 request 为零的资源；历史数据的粒度受 ETL 桶限制。requestEfficiencyMetadata 为可选 v1 汇总状态，CPU 数值单位为 core-minutes，内存数值单位为 byte-minutes，成本使用当前币种；旧客户端可忽略。",
         "tags": [
           "Allocation"
         ],
@@ -417,7 +417,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/allocation/compute/summary": {
       "get": {
-        "description": "返回成本分配摘要数据，支持窗口、聚合、过滤、累积和 CSV 导出。",
+        "description": "返回成本分配摘要数据，支持窗口、聚合、过滤、累积和 CSV 导出。JSON efficiency 对当前行中 request 大于零的 CPU 和内存按成本加权；无有效成本权重时为 null。汇总时按原始 allocation 查询批次排除对应 request 为零的资源；历史数据的粒度受 ETL 桶限制。requestEfficiencyMetadata 为可选 v1 汇总状态，CPU 数值单位为 core-minutes，内存数值单位为 byte-minutes，成本使用当前币种；旧客户端可忽略。",
         "tags": [
           "Allocation"
         ],
@@ -517,7 +517,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/allocation/summary": {
       "get": {
-        "description": "返回成本分配摘要数据，支持窗口、聚合、过滤、累积和 CSV 导出。",
+        "description": "返回成本分配摘要数据，支持窗口、聚合、过滤、累积和 CSV 导出。JSON efficiency 对当前行中 request 大于零的 CPU 和内存按成本加权；无有效成本权重时为 null。汇总时按原始 allocation 查询批次排除对应 request 为零的资源；历史数据的粒度受 ETL 桶限制。requestEfficiencyMetadata 为可选 v1 汇总状态，CPU 数值单位为 core-minutes，内存数值单位为 byte-minutes，成本使用当前币种；旧客户端可忽略。",
         "tags": [
           "Allocation"
         ],

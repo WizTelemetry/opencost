@@ -665,6 +665,43 @@ func TestSummaryAllocationSet_CPUEfficiency(t *testing.T) {
 	}
 }
 
+func TestSummaryAllocationSet_AggregateBy_ShareIdleRequestEfficiency(t *testing.T) {
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	set := &SummaryAllocationSet{Window: NewClosedWindow(start, end)}
+	for _, alloc := range []*Allocation{
+		{Name: "a", Properties: &AllocationProperties{Cluster: "cluster", Namespace: "workload"}, Start: start, End: end, CPUCoreRequestAverage: 1, CPUCoreUsageAverage: 0.2, CPUCost: 2, RAMBytesRequestAverage: 1, RAMBytesUsageAverage: 0.8, RAMCost: 5},
+		{Name: "b", Properties: &AllocationProperties{Cluster: "cluster", Namespace: "workload"}, Start: start, End: end, CPUCoreRequestAverage: 1, CPUCoreUsageAverage: 0.2, CPUCost: 8, RAMBytesRequestAverage: 1, RAMBytesUsageAverage: 0.8, RAMCost: 5},
+		{Name: "cluster/" + IdleSuffix, Properties: &AllocationProperties{Cluster: "cluster"}, Start: start, End: end, CPUCost: 20},
+	} {
+		if err := set.Insert(NewSummaryAllocation(alloc, false, false)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := NewMemoryTotalsStore()
+	store.SetAllocationTotalsByCluster(start, end, map[string]*AllocationTotals{
+		"cluster": {CPUCost: 10, RAMCost: 10},
+	})
+	if err := set.AggregateBy([]string{"namespace"}, &AllocationAggregationOptions{ShareIdle: ShareWeighted, AllocationTotalsStore: store}); err != nil {
+		t.Fatal(err)
+	}
+	if len(set.SummaryAllocations) != 1 {
+		t.Fatalf("expected one aggregated allocation, got %d", len(set.SummaryAllocations))
+	}
+	allocation, ok := set.SummaryAllocations["workload"]
+	if !ok {
+		t.Fatal("missing workload allocation")
+	}
+	response := allocation.ToResponse()
+	if response.CPUCost == nil || !util.IsApproximately(*response.CPUCost, 30) || response.RAMCost == nil || !util.IsApproximately(*response.RAMCost, 10) {
+		t.Fatalf("unexpected shared costs: CPU %v, RAM %v", response.CPUCost, response.RAMCost)
+	}
+	// Idle adds 20 to CPU cost, so (0.2*30 + 0.8*10)/(30+10) = 0.35.
+	if response.TotalEfficiency == nil || !util.IsApproximately(*response.TotalEfficiency, 0.35) {
+		t.Fatalf("expected cost-weighted total efficiency 0.35, got %v", response.TotalEfficiency)
+	}
+}
+
 func TestSummaryAllocationSet_TotalEfficiency(t *testing.T) {
 	// Generating 6 sample summary allocations for testing
 	var sa1, sa2, sa3, sa4, sa5, sa6, idlesa *SummaryAllocation

@@ -1,6 +1,8 @@
 package costmodel
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +33,37 @@ func TestETLStoreAllocationRoundTripReturnsClone(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, 1.0, second.TotalCost())
+}
+
+func TestETLStorePreservesRequestEfficiencyAfterCacheEviction(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	valid := &opencost.Allocation{Name: "valid", Start: start, End: end, CPUCoreRequestAverage: 2, CPUCoreUsageAverage: 1, CPUCost: 2}
+	invalid := &opencost.Allocation{Name: "invalid", Start: start, End: end, CPUCoreUsageAverage: 2, CPUCost: 2}
+	combined, err := valid.Add(invalid)
+	require.NoError(t, err)
+	combined.Name = "combined"
+	set := opencost.NewAllocationSet(start, end)
+	require.NoError(t, set.Insert(combined))
+	store := newETLStore(storage.NewMemoryStorage(), t.TempDir(), "cluster-a", time.Hour, 0.5)
+	require.NoError(t, store.WriteAllocation(set))
+
+	readEfficiency := func() float64 {
+		result, found, err := store.ReadAllocation(start, end, time.Hour)
+		require.NoError(t, err)
+		require.True(t, found)
+		data, err := json.Marshal(result.Get("combined"))
+		require.NoError(t, err)
+		var payload struct {
+			CPUEfficiency *float64 `json:"cpuEfficiency"`
+		}
+		require.NoError(t, json.Unmarshal(data, &payload))
+		require.NotNil(t, payload.CPUEfficiency)
+		return *payload.CPUEfficiency
+	}
+	assert.Equal(t, 0.5, readEfficiency())
+	store.memory.Flush()
+	assert.Equal(t, 0.5, readEfficiency())
 }
 
 func TestETLStoreRequiresReadyMarker(t *testing.T) {
@@ -120,6 +153,36 @@ func TestETLStoreCleanupRemovesExpiredBucketsAcrossPricingRevisions(t *testing.T
 	assert.False(t, store.hasForRevision(etlAllocationKind, oldStart, oldEnd, time.Hour, oldRevision))
 	assert.True(t, store.hasForRevision(etlAllocationKind, recentStart, recentEnd, time.Hour, oldRevision))
 	assert.True(t, store.hasForRevision(etlAllocationKind, recentStart, recentEnd, time.Hour, newRevision))
+}
+
+func TestETLSchemaIsolationAndRollbackRetention(t *testing.T) {
+	now := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	start := now.Add(-2 * time.Hour)
+	end := start.Add(time.Hour)
+	store := newETLStore(storage.NewMemoryStorage(), t.TempDir(), "cluster-a", time.Hour, 0.5)
+	revision := mustETLRevision(t, store)
+	current := store.recordPath(etlAllocationKind, time.Hour, start, end, revision)
+	legacy := strings.Replace(current, "/v4/", "/v3/", 1)
+	require.NotEqual(t, current, legacy)
+	require.NoError(t, store.storage.Write(legacy, []byte("legacy bucket")))
+	require.NoError(t, store.storage.Write(etlBucketMarkerPath(legacy), []byte("legacy marker")))
+	_, found, err := store.ReadAllocation(start, end, time.Hour)
+	require.NoError(t, err)
+	assert.False(t, found)
+	require.NoError(t, store.WriteAllocation(testETLAllocationSet(start, end, 1)))
+	_, err = store.cleanup(now, 24*time.Hour, 7*24*time.Hour)
+	require.NoError(t, err)
+	exists, err := store.storage.Exists(legacy)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = store.storage.Exists(etlBucketMarkerPath(legacy))
+	require.NoError(t, err)
+	assert.True(t, exists)
+	_, err = store.cleanup(now.Add(48*time.Hour), 24*time.Hour, 7*24*time.Hour)
+	require.NoError(t, err)
+	exists, err = store.storage.Exists(legacy)
+	require.NoError(t, err)
+	assert.False(t, exists)
 }
 
 func TestETLStorePartitionUsesDailyThenHourlyBuckets(t *testing.T) {
