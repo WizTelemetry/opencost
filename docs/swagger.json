@@ -2506,7 +2506,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/efficiency/clusters": {
       "get": {
-        "description": "基于分配数据返回效率摘要。默认按集群聚合，支持按节点或自定义标签聚合。返回 groups + groupBy 结构；未显式传 step 时按日查询后累积为整个窗口的摘要；总成本包含 PV 和 idle，efficiency 与分配摘要页面口径一致。",
+        "description": "基于分配数据返回效率摘要。默认按集群聚合，支持按节点或自定义标签聚合。按节点分组时无节点名的未挂载 PV 不生成节点组，但其成本仍计入摘要。返回 groups + groupBy 结构；未显式传 step 时按日查询后累积为整个窗口的摘要；总成本包含 PV 和 idle，efficiency 与分配摘要页面口径一致。",
         "tags": [
           "Efficiency"
         ],
@@ -2590,7 +2590,7 @@
     },
     "/kapis/costwise.wiztelemetry.io/v1alpha1/efficiency/clusters/summary": {
       "get": {
-        "description": "基于分配数据返回效率摘要。默认按集群聚合，支持按节点或自定义标签聚合。返回 groups + groupBy 结构；未显式传 step 时按日查询后累积为整个窗口的摘要；总成本包含 PV 和 idle，efficiency 与分配摘要页面口径一致。",
+        "description": "基于分配数据返回效率摘要。默认按集群聚合，支持按节点或自定义标签聚合。按节点分组时无节点名的未挂载 PV 不生成节点组，但其成本仍计入摘要。返回 groups + groupBy 结构；未显式传 step 时按日查询后累积为整个窗口的摘要；总成本包含 PV 和 idle，efficiency 与分配摘要页面口径一致。",
         "tags": [
           "Efficiency"
         ],

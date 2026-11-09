@@ -366,7 +366,7 @@ func (a *Accesses) ComputeAllocationHandlerSummary(w http.ResponseWriter, r *htt
 // efficiency summary from allocations.
 // @Summary      查询集群效率摘要
 // @Tags         Efficiency
-// @Description  基于分配数据返回效率摘要。默认按集群聚合，支持按节点或自定义标签聚合。返回 groups + groupBy 结构；未显式传 step 时按日查询后累积为整个窗口的摘要；总成本包含 PV 和 idle，efficiency 与分配摘要页面口径一致。
+// @Description  基于分配数据返回效率摘要。默认按集群聚合，支持按节点或自定义标签聚合。按节点分组时无节点名的未挂载 PV 不生成节点组，但其成本仍计入摘要。返回 groups + groupBy 结构；未显式传 step 时按日查询后累积为整个窗口的摘要；总成本包含 PV 和 idle，efficiency 与分配摘要页面口径一致。
 // @Param        window      query  string  true   "时间窗口。必填。"
 // @Param        step        query  string  false  "查询步长。未传时按日查询后累积为整个 window。"
 // @Param        accumulate  query  bool    false  "是否将整个窗口累积为单个结果。"
