@@ -39,7 +39,7 @@ const (
 	etlLateDataDailyLookbackEnvVar   = "OPENCOST_ETL_LATE_DATA_DAILY_LOOKBACK_DAYS"
 	etlLateDataRefreshIntervalEnvVar = "OPENCOST_ETL_LATE_DATA_REFRESH_INTERVAL_SECONDS"
 	etlMinimumCoveragePercentEnvVar  = "OPENCOST_ETL_MINIMUM_COVERAGE_PERCENT"
-	etlSchemaVersion                 = "v3"
+	etlSchemaVersion                 = "v4"
 	defaultETLPricingFingerprint     = "pricing-v1-default"
 	defaultETLStorageDir             = "/var/configs/costwise-etl"
 	defaultETLResolution             = time.Hour

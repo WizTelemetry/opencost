@@ -261,6 +261,42 @@ func TestSummaryAllocationSetClusterEfficiencySet_NodeGroupingUsesAllocationName
 	}
 }
 
+func TestNodeEfficiencyDoesNotGroupUnmountedPVWithoutNode(t *testing.T) {
+	start := time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+	sas := &SummaryAllocationSet{
+		Window: NewWindow(&start, &end),
+		SummaryAllocations: map[string]*SummaryAllocation{
+			"cluster-a/node-a": {
+				Name: "cluster-a/node-a", Properties: &AllocationProperties{Cluster: "cluster-a", Node: "node-a"},
+				Start: start, End: end, CPUCoreRequestAverage: 2, CPUCoreUsageAverage: 1, CPUCost: 10,
+			},
+			"cluster-a/": {
+				Name: "cluster-a/", Properties: &AllocationProperties{Cluster: "cluster-a", Container: UnmountedSuffix},
+				Start: start, End: end, PVCost: 3,
+			},
+			"cluster-b/": {
+				Name: "cluster-b/", Properties: &AllocationProperties{Cluster: "cluster-b"},
+				Start: start, End: end, CPUCoreRequestAverage: 1, CPUCoreUsageAverage: 0.5, CPUCost: 4,
+			},
+			"__idle__": {Name: "__idle__", Start: start, End: end, CPUCost: 5},
+		},
+	}
+
+	nodes := sas.ClusterEfficiencySet([]string{AllocationClusterProp, AllocationNodeProp})
+	if len(nodes.Groups) != 3 || nodes.Groups["cluster-a/node-a"] == nil || nodes.Groups["cluster-b/"] == nil || nodes.Groups["__idle__"] == nil || nodes.Groups["cluster-a/"] != nil {
+		t.Fatalf("expected node, unknown workload and idle, but no unmounted PV group, got %#v", nodes.Groups)
+	}
+	if nodes.Summary.TotalCost != 22 || nodes.Summary.PV == nil || nodes.Summary.PV.Allocation != 3 {
+		t.Fatalf("summary must retain PV cost: %#v", nodes.Summary)
+	}
+
+	clusters := sas.ClusterEfficiencySet([]string{AllocationClusterProp})
+	if clusters.Groups["cluster-a/"] == nil || clusters.Summary.TotalCost != 22 {
+		t.Fatalf("non-node grouping should retain existing behavior: %#v", clusters)
+	}
+}
+
 func TestSummaryAllocationSetClusterEfficiencySet_SummaryEfficiencyIsRecomputedFromInputs(t *testing.T) {
 	start := time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC)
 	end := start.Add(24 * time.Hour)

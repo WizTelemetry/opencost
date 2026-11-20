@@ -66,6 +66,19 @@ type AllocationJSON struct {
 	LoadBalancers                  LbAllocations                   `json:"lbAllocations"`
 	SharedCostBreakdown            *SharedCostBreakdowns           `json:"sharedCostBreakdown,omitempty"`
 	GPUAllocation                  *GPUAllocation                  `json:"gpuAllocation"`
+	RequestEfficiencyMetadata      *requestEfficiencyMetadata      `json:"requestEfficiencyMetadata,omitempty"`
+}
+
+type requestEfficiencyMetadata struct {
+	Version           int     `json:"version"`
+	CPURequestMinutes float64 `json:"cpuRequestMinutes"`
+	CPUUsageMinutes   float64 `json:"cpuUsageMinutes"`
+	CPUCost           float64 `json:"cpuCost"`
+	CPUCostAdjustment float64 `json:"cpuCostAdjustment"`
+	RAMRequestMinutes float64 `json:"ramRequestMinutes"`
+	RAMUsageMinutes   float64 `json:"ramUsageMinutes"`
+	RAMCost           float64 `json:"ramCost"`
+	RAMCostAdjustment float64 `json:"ramCostAdjustment"`
 }
 
 func (aj *AllocationJSON) BuildFromAllocation(a *Allocation) {
@@ -86,7 +99,8 @@ func (aj *AllocationJSON) BuildFromAllocation(a *Allocation) {
 	aj.CPUCost = formatFloat64ForResponse(a.CPUCost)
 	aj.CPUCostAdjustment = formatFloat64ForResponse(a.CPUCostAdjustment)
 	aj.CPUCostIdle = formatFloat64ForResponse(a.CPUCostIdle)
-	aj.CPUEfficiency = formatFloat64ForResponse(a.CPUEfficiency())
+	stats := a.requestStats().finiteCopy()
+	aj.CPUEfficiency = requestEfficiency(stats.cpuRequest, stats.cpuUsage)
 	aj.GPUCount = formatFloat64ForResponse(a.GPUs())
 	aj.GPUHours = formatFloat64ForResponse(a.GPUHours)
 	aj.GPUCost = formatFloat64ForResponse(a.GPUCost)
@@ -115,16 +129,62 @@ func (aj *AllocationJSON) BuildFromAllocation(a *Allocation) {
 	aj.RAMCost = formatFloat64ForResponse(a.RAMCost)
 	aj.RAMCostAdjustment = formatFloat64ForResponse(a.RAMCostAdjustment)
 	aj.RAMCostIdle = formatFloat64ForResponse(a.RAMCostIdle)
-	aj.RAMEfficiency = formatFloat64ForResponse(a.RAMEfficiency())
+	aj.RAMEfficiency = requestEfficiency(stats.ramRequest, stats.ramUsage)
 	aj.SharedCost = formatFloat64ForResponse(a.SharedCost)
 	aj.ExternalCost = formatFloat64ForResponse(a.ExternalCost)
 	aj.TotalCost = formatFloat64ForResponse(a.TotalCost())
-	aj.TotalEfficiency = formatFloat64ForResponse(a.TotalEfficiency())
+	aj.TotalEfficiency = stats.total()
 	aj.RawAllocationOnly = a.RawAllocationOnly
 	aj.ProportionalAssetResourceCosts = &a.ProportionalAssetResourceCosts
 	aj.LoadBalancers = a.LoadBalancers
 	aj.SharedCostBreakdown = &a.SharedCostBreakdown
 	aj.GPUAllocation = a.GPUAllocation
+	aj.RequestEfficiencyMetadata = metadataForRequestEfficiency(a.requestEfficiencyStats)
+}
+
+func metadataForRequestEfficiency(s *requestEfficiencyStats) *requestEfficiencyMetadata {
+	if s == nil {
+		return nil
+	}
+	s = s.finiteCopy()
+	return &requestEfficiencyMetadata{Version: 1, CPURequestMinutes: s.cpuRequest, CPUUsageMinutes: s.cpuUsage,
+		CPUCost: s.cpuCost, CPUCostAdjustment: s.cpuAdjustment, RAMRequestMinutes: s.ramRequest,
+		RAMUsageMinutes: s.ramUsage, RAMCost: s.ramCost, RAMCostAdjustment: s.ramAdjustment}
+}
+
+func (m *requestEfficiencyMetadata) stats() (*requestEfficiencyStats, error) {
+	if m == nil {
+		return nil, nil
+	}
+	if m.Version != 1 {
+		return nil, fmt.Errorf("unsupported request efficiency metadata version %d", m.Version)
+	}
+	return &requestEfficiencyStats{cpuRequest: m.CPURequestMinutes, cpuUsage: m.CPUUsageMinutes,
+		cpuCost: m.CPUCost, cpuAdjustment: m.CPUCostAdjustment, ramRequest: m.RAMRequestMinutes,
+		ramUsage: m.RAMUsageMinutes, ramCost: m.RAMCost, ramAdjustment: m.RAMCostAdjustment}, nil
+}
+
+func requestEfficiency(request, usage float64) *float64 {
+	if request <= 0 {
+		return nil
+	}
+	return formatFloat64ForResponse(usage / request)
+}
+
+func weightedRequestEfficiency(cpuRequest, cpuUsage, cpuCost, ramRequest, ramUsage, ramCost float64) *float64 {
+	var numerator, denominator float64
+	if cpuRequest > 0 {
+		numerator += cpuUsage / cpuRequest * cpuCost
+		denominator += cpuCost
+	}
+	if ramRequest > 0 {
+		numerator += ramUsage / ramRequest * ramCost
+		denominator += ramCost
+	}
+	if denominator <= 0 {
+		return nil
+	}
+	return formatFloat64ForResponse(numerator / denominator)
 }
 
 // formatFloat64ForResponse - take an existing float64, round it to 6 decimal places and return is possible, or return nil if invalid
@@ -150,13 +210,23 @@ func (a *Allocation) MarshalJSON() ([]byte, error) {
 	return buffer, nil
 }
 
-// UnmarshalJSON prevent nil pointer on PVAllocations
+// UnmarshalJSON restores optional aggregation metadata and initializes PVAllocations.
 func (a *Allocation) UnmarshalJSON(b []byte) error {
 	// initialize PV to prevent nil panic
 	a.PVs = PVAllocations{}
 	// Aliasing Allocation and casting to alias gives access to the default unmarshaller
 	type alloc Allocation
 	err := json.Unmarshal(b, (*alloc)(a))
+	if err != nil {
+		return err
+	}
+	var metadata struct {
+		RequestEfficiencyMetadata *requestEfficiencyMetadata `json:"requestEfficiencyMetadata"`
+	}
+	if err := json.Unmarshal(b, &metadata); err != nil {
+		return err
+	}
+	a.requestEfficiencyStats, err = metadata.RequestEfficiencyMetadata.stats()
 	if err != nil {
 		return err
 	}

@@ -290,11 +290,22 @@ func (sas *SummaryAllocationSet) ClusterEfficiencySet(groupBy []string) *Cluster
 		return nil
 	}
 
+	groupByNode := false
+	for _, dimension := range groupBy {
+		if dimension == AllocationNodeProp {
+			groupByNode = true
+			break
+		}
+	}
+
 	workloadByCluster := make(map[string]*SummaryAllocation, len(sas.SummaryAllocations))
 	idleByCluster := make(map[string]*SummaryAllocation, len(sas.SummaryAllocations))
 	clusters := make(map[string]*ClusterEfficiency, len(sas.SummaryAllocations))
 	for _, sa := range sas.SummaryAllocations {
 		if sa == nil || sa.IsExternal() || sa.IsUnallocated() || sa.IsUnmounted() {
+			continue
+		}
+		if groupByNode && sa.Properties != nil && sa.Properties.Node == "" && sa.Properties.Container == UnmountedSuffix {
 			continue
 		}
 

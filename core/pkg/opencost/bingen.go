@@ -44,8 +44,9 @@ package opencost
 // @bingen:end
 
 // Allocation Version Set: Includes Allocation pipeline specific resources
-// @bingen:set[name=Allocation,version=25]
+// @bingen:set[name=Allocation,version=26]
 // @bingen:generate[migrate]:Allocation
+// @bingen:generate:requestEfficiencyStats
 // @bingen:generate[streamable,stringtable]:AllocationSet
 // @bingen:generate:AllocationSetRange
 // @bingen:generate:AllocationProperties
@@ -79,4 +80,4 @@ package opencost
 // @bingen:generate:NetworkDetailsSet
 // @bingen:end
 
-//go:generate bingen -package=opencost -version=18 -buffer=github.com/opencost/opencost/core/pkg/util
+//go:generate go run github.com/opencost/bingen/cmd/bingen@194f1ce1136c956d4d6d457ed0bfe96840ea0f49 -package=opencost -version=18 -buffer=github.com/opencost/opencost/core/pkg/util

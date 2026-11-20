@@ -13,11 +13,7 @@ They are not interchangeable and should not be described with the same business 
 
 ## 1. Allocation Efficiency
 
-This is the efficiency value shown on allocation-derived results such as:
-
-- `/allocation`
-- `/allocation/compute`
-- allocation summary/topline style pages derived from allocation data
+The allocation model's internal efficiency calculations are used by allocation-derived results and other calculations. The JSON efficiency fields on `/allocation` and `/allocation/compute` use the request-aware response rules described below; clients may also calculate their own values.
 
 Relevant code:
 
@@ -25,7 +21,7 @@ Relevant code:
 - [core/pkg/opencost/summaryallocation.go](/Users/zhangpeng/GolandProjects/github.com/Gentleelephant/opencost/core/pkg/opencost/summaryallocation.go:430)
 - [core/pkg/opencost/summaryallocation.go](/Users/zhangpeng/GolandProjects/github.com/Gentleelephant/opencost/core/pkg/opencost/summaryallocation.go:457)
 
-### Per-record CPU efficiency
+### Internal per-record CPU efficiency
 
 ```text
 cpuEfficiency =
@@ -56,18 +52,28 @@ totalEfficiency =
   (cpuCost * cpuEfficiency + ramCost * ramEfficiency) / (cpuCost + ramCost)
 ```
 
+### JSON response fields
+
+For `/allocation` and `/allocation/compute`, `cpuEfficiency` and `ramEfficiency` are `null` when the corresponding request is zero or negative; otherwise they are usage divided by request. `totalEfficiency` is weighted by CPU and RAM costs only for resources with a positive request, or `null` if their combined cost is not positive. The summary API applies the same rule to its `efficiency` field.
+
+Before grouping or accumulating records, CPU and RAM independently exclude inputs whose corresponding request is not positive. The eligible usage multiplied by duration, request multiplied by duration, and cost are accumulated separately. Resource efficiency is eligible usage-minutes divided by eligible request-minutes; total efficiency weights these resource ratios by eligible resource costs. The finest available input is a queried container allocation or an ETL bucket; request changes inside that window cannot be recovered from window averages. The existing request and usage fields still include all inputs and cannot be used to reconstruct the request-valid efficiency for a mixed group.
+
+Aggregated allocation and summary JSON may include optional `requestEfficiencyMetadata` for round trips and later aggregation. Version 1 stores `cpuRequestMinutes` and `cpuUsageMinutes` in core-minutes, `ramRequestMinutes` and `ramUsageMinutes` in byte-minutes, plus `cpuCost`, `ramCost`, `cpuCostAdjustment`, and `ramCostAdjustment` in the configured cost currency. Existing clients may ignore this additive field. Old JSON without metadata remains readable, but cannot recover the eligibility of already merged children.
+
+ETL schema v4 stores version 26 allocation data with these statistics and does not read v3 buckets; missing data is computed from the source. Older deployments continue to use v3 on rollback, subject to the configured retention period. Source history and ETL bucket resolution limit recoverable detail.
+
 ### Important behavior
 
 - Only `CPU` and `RAM` participate in `totalEfficiency`
 - `PV`, `GPU`, `Network`, `LoadBalancer`, `SharedCost`, and `ExternalCost` do not participate in this formula
 - `cpuEfficiency` and `ramEfficiency` can be greater than `1`
-- Idle rows such as `__idle__` return `0` efficiency in raw data and are usually rendered as `-` in the UI
+- Idle rows such as `__idle__` have no request and return `null` for the JSON request-efficiency fields.
 
 ## 2. Aggregated Allocation Efficiency
 
 When a total row is shown across multiple allocation records or multiple time buckets, the total is not the arithmetic average of row efficiencies.
 
-The system first aggregates resource request/usage and cost, then recalculates efficiency.
+For request-aware JSON fields, the system aggregates eligible resource request, usage and cost, then recalculates efficiency. The formulas below sum only inputs with a positive request for the corresponding resource.
 
 Relevant code:
 

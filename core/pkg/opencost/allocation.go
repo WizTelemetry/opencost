@@ -107,8 +107,9 @@ type Allocation struct {
 	CPUCoreLimitAverage         float64        `json:"cpuCoreLimitAverage"` //@bingen:field[version=24]
 	RAMBytesLimitAverage        float64        `json:"ramByteLimitAverage"` //@bingen:field[version=24]
 	// NAT Gateway Costs
-	NetworkNatGatewayEgressCost  float64 `json:"networkNatGatewayEgressCost"`  //@bingen:field[version=25]
-	NetworkNatGatewayIngressCost float64 `json:"networkNatGatewayIngressCost"` //@bingen:field[version=25]
+	NetworkNatGatewayEgressCost  float64                 `json:"networkNatGatewayEgressCost"`  //@bingen:field[version=25]
+	NetworkNatGatewayIngressCost float64                 `json:"networkNatGatewayIngressCost"` //@bingen:field[version=25]
+	requestEfficiencyStats       *requestEfficiencyStats `json:"-"`                            //@bingen:field[version=26]
 }
 
 type GPUAllocation struct {
@@ -742,7 +743,13 @@ func (a *Allocation) Clone() *Allocation {
 		return nil
 	}
 
+	var stats *requestEfficiencyStats
+	if a.requestEfficiencyStats != nil {
+		copy := *a.requestEfficiencyStats
+		stats = &copy
+	}
 	return &Allocation{
+		requestEfficiencyStats:         stats,
 		Name:                           a.Name,
 		Properties:                     a.Properties.Clone(),
 		Window:                         a.Window.Clone(),
@@ -1136,6 +1143,12 @@ func (a *Allocation) ResetAdjustments() {
 		return
 	}
 
+	if s := a.requestEfficiencyStats; s != nil {
+		s.cpuCost -= s.cpuAdjustment
+		s.ramCost -= s.ramAdjustment
+		s.cpuAdjustment = 0
+		s.ramAdjustment = 0
+	}
 	a.CPUCostAdjustment = 0.0
 	a.GPUCostAdjustment = 0.0
 	a.RAMCostAdjustment = 0.0
@@ -1248,6 +1261,10 @@ func (a *Allocation) add(that *Allocation) {
 		log.Warnf("Allocation.AggregateBy: trying to add a nil receiver")
 		return
 	}
+
+	stats := *a.requestStats()
+	stats.add(that.requestStats())
+	a.requestEfficiencyStats = &stats
 
 	// Generate keys for each allocation to allow for special logic to set the controller
 	// in the case of keys matching but controllers not matching.
@@ -1921,6 +1938,7 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 				idleCPUCost := idleAlloc.CPUCost * idleCoefficients[idleId][alloc.Name]["cpu"]
 				idleGPUCost := idleAlloc.GPUCost * idleCoefficients[idleId][alloc.Name]["gpu"]
 				idleRAMCost := idleAlloc.RAMCost * idleCoefficients[idleId][alloc.Name]["ram"]
+				alloc.addSharedIdleToRequestStats(idleCPUCost, idleRAMCost)
 				alloc.CPUCost += idleCPUCost
 				alloc.GPUCost += idleGPUCost
 				alloc.RAMCost += idleRAMCost
@@ -1977,6 +1995,7 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 				idleCPUCost := idleAlloc.CPUCost * idleCoefficients[idleId][alloc.Name]["cpu"]
 				idleGPUCost := idleAlloc.GPUCost * idleCoefficients[idleId][alloc.Name]["gpu"]
 				idleRAMCost := idleAlloc.RAMCost * idleCoefficients[idleId][alloc.Name]["ram"]
+				alloc.addSharedIdleToRequestStats(idleCPUCost, idleRAMCost)
 				alloc.CPUCost += idleCPUCost
 				alloc.GPUCost += idleGPUCost
 				alloc.RAMCost += idleRAMCost
@@ -2715,6 +2734,14 @@ func (a *Allocation) StringMapProperty(property string) (map[string]string, erro
 func (a *Allocation) SanitizeNaN() {
 	if a == nil {
 		return
+	}
+	if s := a.requestEfficiencyStats; s != nil {
+		if math.IsNaN(s.cpuRequest) || math.IsInf(s.cpuRequest, 0) || math.IsNaN(s.cpuUsage) || math.IsInf(s.cpuUsage, 0) || math.IsNaN(s.cpuCost) || math.IsInf(s.cpuCost, 0) || math.IsNaN(s.cpuAdjustment) || math.IsInf(s.cpuAdjustment, 0) {
+			s.cpuRequest, s.cpuUsage, s.cpuCost, s.cpuAdjustment = 0, 0, 0, 0
+		}
+		if math.IsNaN(s.ramRequest) || math.IsInf(s.ramRequest, 0) || math.IsNaN(s.ramUsage) || math.IsInf(s.ramUsage, 0) || math.IsNaN(s.ramCost) || math.IsInf(s.ramCost, 0) || math.IsNaN(s.ramAdjustment) || math.IsInf(s.ramAdjustment, 0) {
+			s.ramRequest, s.ramUsage, s.ramCost, s.ramAdjustment = 0, 0, 0, 0
+		}
 	}
 	if math.IsNaN(a.CPUCost) {
 		log.DedupedWarningf(5, "Allocation: Unexpected NaN found for CPUCost: name:%s, window:%s, properties:%s", a.Name, a.Window.String(), a.Properties.String())
